@@ -832,6 +832,7 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int, rejected 
 func (r *raft) Step(m pb.Message) error {
 	// Handle the message term, which may result in our stepping down to a follower.
 	switch {
+	// 首先根据消息的Term值进行分类处理
 	case m.Term == 0:
 		// local message
 	case m.Term > r.Term:
@@ -905,16 +906,19 @@ func (r *raft) Step(m pb.Message) error {
 	}
 
 	switch m.Type {
+	// 根据Message的Type进行分类处理
 	case pb.MsgHup:
-		if r.state != StateLeader {
+		if r.state != StateLeader {	// 只有非Leader状态的节点才会处理MsgHup消息
 			if !r.promotable() {
 				r.logger.Warningf("%x is unpromotable and can not campaign; ignoring MsgHup", r.id)
 				return nil
 			}
+			// 获取raftLog中已经提交但未应用(即applied~committed)的Entry记录，异常处理略
 			ents, err := r.raftLog.slice(r.raftLog.applied+1, r.raftLog.committed+1, noLimit)
 			if err != nil {
 				r.logger.Panicf("unexpected error getting unapplied entries (%v)", err)
 			}
+			// 检测是否有未应用的EntryConfChange记录，如果有就放弃发起选举的机会
 			if n := numOfPendingConf(ents); n != 0 && r.raftLog.committed > r.raftLog.applied {
 				r.logger.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
 				return nil
