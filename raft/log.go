@@ -85,33 +85,39 @@ func (l *raftLog) String() string {
 
 // maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
 // it returns (last index of new entries, true).
+// 第一个参数index：MsgApp消息携带的第一条Entry的Index值；MsgApp消息对应Raft协议中提到的Append Entries消息；
+// 第二个参数logTerm：MsgApp消息的LogTerm字段，通过消息中携带的该Term值与当前节点记录的Term值比较，就可以判断消息是否过时；
+// 第三个参数committed：MsgApp消息的Commit字段，Leader节点通过该字段通知Follower节点当前已提交Entry的位置；
+// 第四个参数ents：MsgApp消息中携带的Entry记录，即待追加到raftLog中的Entry记录；
 func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (lastnewi uint64, ok bool) {
-	if l.matchTerm(index, logTerm) {
+	if l.matchTerm(index, logTerm) { // 检测MsgApp消息的index和logTerm是否合法
 		lastnewi = index + uint64(len(ents))
 		ci := l.findConflict(ents)
 		switch {
-		case ci == 0:
-		case ci <= l.committed:
+		case ci == 0: // 表示raftLog中已经包含了所有待追加的Entry记录，不必进行任何追加操作；
+		case ci <= l.committed: // 如果出现冲突的位置是已提交的记录，则输出异常日志并终止整个程序；
 			l.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
-		default:
+		default: // 如果冲突位置是未提交的部分；
 			offset := index + 1
-			l.append(ents[ci-offset:]...)
+			l.append(ents[ci-offset:]...) // 则将ents中发生冲突的部分追加到raftLog中
 		}
-		l.commitTo(min(committed, lastnewi))
+		l.commitTo(min(committed, lastnewi)) // 更新raftLog.committed字段
 		return lastnewi, true
 	}
 	return 0, false
 }
 
 func (l *raftLog) append(ents ...pb.Entry) uint64 {
+	// 合法性检测
 	if len(ents) == 0 {
 		return l.lastIndex()
 	}
 	if after := ents[0].Index - 1; after < l.committed {
 		l.logger.Panicf("after(%d) is out of range [committed(%d)]", after, l.committed)
 	}
+	// 将Entry记录追加到unstable中
 	l.unstable.truncateAndAppend(ents)
-	return l.lastIndex()
+	return l.lastIndex() // 返回raftLog最后一条日志记录的索引
 }
 
 // findConflict finds the index of the conflict.
@@ -125,17 +131,19 @@ func (l *raftLog) append(ents ...pb.Entry) uint64 {
 // a different term.
 // The first entry MUST have an index equal to the argument 'from'.
 // The index of the given entries MUST be continuously increasing.
+// 遍历待追加的Entry集合，查找是否与raftLog中已有的Entry发生冲突(Index相同但Term不同)
 func (l *raftLog) findConflict(ents []pb.Entry) uint64 {
+	// 遍历全部待追加的Entry，判断raftLog中是否存在冲突的Entry记录
 	for _, ne := range ents {
-		if !l.matchTerm(ne.Index, ne.Term) {
+		if !l.matchTerm(ne.Index, ne.Term) { // 查找冲突的Entry记录
 			if ne.Index <= l.lastIndex() {
 				l.logger.Infof("found conflict at index %d [existing term: %d, conflicting term: %d]",
 					ne.Index, l.zeroTermOnErrCompacted(l.term(ne.Index)), ne.Term)
 			}
-			return ne.Index
+			return ne.Index // 返回冲突记录的索引值；待追加的Entry记录在raftLog中不存在时，返回第一条不存在Entry记录的索引值；
 		}
 	}
-	return 0
+	return 0 // 如果没有发生冲突Entry，则返回0
 }
 
 func (l *raftLog) unstableEntries() []pb.Entry {
@@ -174,6 +182,7 @@ func (l *raftLog) snapshot() (pb.Snapshot, error) {
 	return l.storage.Snapshot()
 }
 
+// 返回raftLog中第一条Entry记录的索引值
 func (l *raftLog) firstIndex() uint64 {
 	if i, ok := l.unstable.maybeFirstIndex(); ok {
 		return i
@@ -185,6 +194,7 @@ func (l *raftLog) firstIndex() uint64 {
 	return index
 }
 
+// 返回raftLog中最后一条Entry记录的索引值
 func (l *raftLog) lastIndex() uint64 {
 	if i, ok := l.unstable.maybeLastIndex(); ok {
 		return i
@@ -198,11 +208,12 @@ func (l *raftLog) lastIndex() uint64 {
 
 func (l *raftLog) commitTo(tocommit uint64) {
 	// never decrease commit
+	// raftLog.committed字段只能后移，不能前移
 	if l.committed < tocommit {
 		if l.lastIndex() < tocommit {
 			l.logger.Panicf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, l.lastIndex())
 		}
-		l.committed = tocommit
+		l.committed = tocommit // 更新committed字段
 	}
 }
 
@@ -228,22 +239,27 @@ func (l *raftLog) lastTerm() uint64 {
 	return t
 }
 
+// 先去unstable中查找相应的Entry记录，如果查不到，再去storage中查找；
 func (l *raftLog) term(i uint64) (uint64, error) {
 	// the valid term range is [index of dummy entry, last index]
+	// 检测指定的索引值的合法性
 	dummyIndex := l.firstIndex() - 1
 	if i < dummyIndex || i > l.lastIndex() {
 		// TODO: return an error instead?
 		return 0, nil
 	}
 
+	// 尝试从unstable中获取对应的Entry记录并返回其Term值
 	if t, ok := l.unstable.maybeTerm(i); ok {
 		return t, nil
 	}
 
+	// 尝试从storage中获取对应的Entry记录并返回其Term值
 	t, err := l.storage.Term(i)
 	if err == nil {
 		return t, nil
 	}
+	// 异常场景
 	if err == ErrCompacted || err == ErrUnavailable {
 		return 0, err
 	}
@@ -281,7 +297,7 @@ func (l *raftLog) isUpToDate(lasti, term uint64) bool {
 }
 
 func (l *raftLog) matchTerm(i, term uint64) bool {
-	t, err := l.term(i)
+	t, err := l.term(i) // 查询指定索引值对应的Entry记录的Term值
 	if err != nil {
 		return false
 	}

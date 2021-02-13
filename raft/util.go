@@ -215,13 +215,14 @@ func limitSize(ents []pb.Entry, maxSize uint64) []pb.Entry {
 	}
 	size := ents[0].Size()
 	var limit int
+	// 遍历ents切片，查找limit（limit下标之前所有Entry的字节数之和，小于maxSize值）
 	for limit = 1; limit < len(ents); limit++ {
 		size += ents[limit].Size()
 		if uint64(size) > maxSize {
 			break
 		}
 	}
-	return ents[:limit]
+	return ents[:limit] // 返回ents切片中limit之前的部分
 }
 
 func assertConfStatesEquivalent(l Logger, cs1, cs2 pb.ConfState) {
