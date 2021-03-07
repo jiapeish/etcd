@@ -434,6 +434,9 @@ func (r *raft) send(m pb.Message) {
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer.
+// 在leader节点尝试向集群中的follower节点发送MsgApp消息时，如果查找不到待发送的Entry记录（即该follower节点对应的progress-next指定的entry记录），
+// 则会尝试通过MsgSnap消息将快照数据发送到follower节点，之后follower通过快照数据恢复其自身状态，进而与leader节点进行正常的entry记录复制，
+// 当follower节点宕机时间比较长时，就有可能出现发送MsgSnap的场景
 func (r *raft) sendAppend(to uint64) {
 	r.maybeSendAppend(to, true)
 }
@@ -469,13 +472,13 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 
 	// 上边2个raftLog查找异常时，将发送MsgSnap消息
 	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
-		if !pr.RecentActive {
+		if !pr.RecentActive { // 从当前leader节点的角度看，目标follower节点已经不再存活
 			r.logger.Debugf("ignore sending snapshot to %x since it is not recently active", to)
 			return false
 		}
 
 		m.Type = pb.MsgSnap
-		snapshot, err := r.raftLog.snapshot()
+		snapshot, err := r.raftLog.snapshot() // 获取快照数据
 		if err != nil {
 			if err == ErrSnapshotTemporarilyUnavailable {
 				r.logger.Debugf("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
@@ -486,10 +489,11 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 		if IsEmptySnap(snapshot) {
 			panic("need non-empty snapshot")
 		}
-		m.Snapshot = snapshot
-		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		m.Snapshot = snapshot // 设置MsgSnap消息的snapshot字段
+		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term // 获取快照的相关信息
 		r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
 			r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
+		// 将目标follower节点的progress切换成stateSnapshot状态，其中会用pendingSnapshot字段记录快照数据的信息
 		pr.BecomeSnapshot(sindex)
 		r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
 	} else {
@@ -683,7 +687,7 @@ func (r *raft) tickElection() {
 
 // tickHeartbeat is run by leaders to send a MsgBeat after r.heartbeatTimeout.
 // 从该方法可知，MsgCheckQuorum消息和MsgBeat消息的term字段都为0，因此也属于本地消息；
-// 在raft-step方法中并没有对这2种消息进行特殊处理，他们的处理主要在raft-stepLeader方法中
+// 在raft-step方法中并没有对这2种消息进行特殊处理，他们的处理主要在raft-step-leader方法中
 func (r *raft) tickHeartbeat() {
 	r.heartbeatElapsed++ // 递增心跳计时器
 	r.electionElapsed++ // 递增选举计时器
@@ -1065,11 +1069,15 @@ func stepLeader(r *raft, m pb.Message) error {
 			// drop any new proposals.
 			return ErrProposalDropped
 		}
+
+		// 在进行leader节点迁移时，leader节点会停止处理客户端发来的MsgProp消息，如果客户端不断追加entry记录，就可能使目标follower节点与leader节点
+		// 的raftLog始终不一致，从而导致leader节点的迁移超时；
 		if r.leadTransferee != None { // 检测当前节点是否正在进行leader节点转移，是的话则不再处理MsgProp消息
 			r.logger.Debugf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
 			return ErrProposalDropped
 		}
 
+		// 向raftLog中追加entry记录
 		for i := range m.Entries { // 遍历MsgProp消息携带的全部entry记录
 			e := &m.Entries[i]
 			var cc pb.ConfChangeI
@@ -1138,13 +1146,14 @@ func stepLeader(r *raft, m pb.Message) error {
 			// leader节点检测自己在当前任期中是否已经提交过entry记录，如果没有，
 			// 则无法进行读取操作（见raft协议）,直接返回
 			switch r.readOnly.option {
+			// 在readOnlySafe模式下的只读请求处理，不会受到节点之间时钟差异和网络分区的影响，是推荐的模式；
 			case ReadOnlySafe:
 				r.readOnly.addRequest(r.raftLog.committed, m) // 记录当前节点的raftLog-committed字段值，即已提交位置
 				// The local node automatically acks the request.
 				r.readOnly.recvAck(r.id, m.Entries[0].Data)
 				r.bcastHeartbeatWithCtx(m.Entries[0].Data) // 发送心跳，这个消息会将上述生成的id作为context字段的值
 			case ReadOnlyLeaseBased:
-				ri := r.raftLog.committed
+				ri := r.raftLog.committed // 已提交位置
 				if m.From == None || m.From == r.id { // from local member
 					r.readStates = append(r.readStates, ReadState{Index: ri, RequestCtx: m.Entries[0].Data})
 				} else {
@@ -1240,6 +1249,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				}
 				// Transfer leadership is in progress.
 				// 处理leader节点迁移
+				// 当收到目标follower节点的MsgAppResp消息，并且两者的raftLog完全匹配，才发送MsgTimeoutNow消息
 				if m.From == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
 					r.logger.Infof("%x sent MsgTimeoutNow to %x after received MsgAppResp", r.id, m.From)
 					r.sendTimeoutNow(m.From)
@@ -1290,63 +1300,75 @@ func stepLeader(r *raft, m pb.Message) error {
 			}
 		}
 	case pb.MsgSnapStatus:
-		if pr.State != tracker.StateSnapshot {
+		// 如下2个消息MsgSnapStatus和MsgUnreachable，也与MsgSnap有关，如果leader节点发送MsgSnap消息出现异常，则会调用相关方法发送这2种消息
+		if pr.State != tracker.StateSnapshot { // 检测follower节点的状态是否为snapshot
 			return nil
 		}
 		// TODO(tbg): this code is very similar to the snapshot handling in
 		// MsgAppResp above. In fact, the code there is more correct than the
 		// code here and should likely be updated to match (or even better, the
 		// logic pulled into a newly created Progress state machine handler).
-		if !m.Reject {
+		if !m.Reject { // 之前发送MsgSnap消息时出现异常
 			pr.BecomeProbe()
 			r.logger.Debugf("%x snapshot succeeded, resumed sending replication messages to %x [%s]", r.id, m.From, pr)
 		} else {
+			// 发送MsgSnap消息失败，则要清空progress-pendingSnapshot字段
 			// NB: the order here matters or we'll be probing erroneously from
 			// the snapshot index, but the snapshot never applied.
 			pr.PendingSnapshot = 0
 			pr.BecomeProbe()
 			r.logger.Debugf("%x snapshot failed, resumed sending replication messages to %x [%s]", r.id, m.From, pr)
 		}
+		// 注意，无论MsgSnap消息是否发送失败，都会将progress切换为probe，之后发送单条消息进行探测
+
 		// If snapshot finish, wait for the MsgAppResp from the remote node before sending
 		// out the next MsgApp.
 		// If snapshot failure, wait for a heartbeat interval before next try
+		// 暂停leader节点向该follower节点继续发送消息：
+		// 1、如果发送MsgSnap消息成功了，则待leader节点收到相应的响应消息(MsgAppResp消息），即可继续发送后续的MsgApp消息；
+		// 2、如果发送MsgSnap消息失败了，则leader节点会等到收到MsgHeartbeatResp消息时，才会重新开始发送后续消息；
 		pr.ProbeSent = true
 	case pb.MsgUnreachable:
 		// During optimistic replication, if the remote becomes unreachable,
 		// there is huge probability that a MsgApp is lost.
+		// 当follower节点变得不可达，如果继续发送MsgApp消息，则会有大量消息丢失
 		if pr.State == tracker.StateReplicate {
-			pr.BecomeProbe()
+			pr.BecomeProbe() // 将follower节点的progress状态切换为probe
 		}
 		r.logger.Debugf("%x failed to send message to %x because it is unreachable [%s]", r.id, m.From, pr)
 	case pb.MsgTransferLeader:
+		// leader节点转移涉及MsgTransferLeader和MsgTimeoutNow消息的处理，
+		// leader节点转移指：指定一个特定的节点作为下一个term的leader节点，当前leader节点会选择一个合适的节点，然后发送MsgTransferLeader消息
 		if pr.IsLearner {
 			r.logger.Debugf("%x is learner. Ignored transferring leadership", r.id)
 			return nil
 		}
-		leadTransferee := m.From
+		leadTransferee := m.From // from字段记录了此次leader节点迁移操作的目标follower节点的id
 		lastLeadTransferee := r.leadTransferee
-		if lastLeadTransferee != None {
-			if lastLeadTransferee == leadTransferee {
+		if lastLeadTransferee != None { // 检测当前是否有一次未处理完的leader节点迁移操作
+			if lastLeadTransferee == leadTransferee { // 目标节点相同，则忽略本次迁移操作
 				r.logger.Infof("%x [term %d] transfer leadership to %x is in progress, ignores request to same node %x",
 					r.id, r.Term, leadTransferee, leadTransferee)
 				return nil
 			}
-			r.abortLeaderTransfer()
+			r.abortLeaderTransfer() // 若目标节点不同，则清空上次记录的id(即raft-leadTransferee)
 			r.logger.Infof("%x [term %d] abort previous transferring leadership to %x", r.id, r.Term, lastLeadTransferee)
 		}
-		if leadTransferee == r.id {
+		if leadTransferee == r.id { // 若目标节点已经是leader，则放弃此次迁移
 			r.logger.Debugf("%x is already leader. Ignored transferring leadership to self", r.id)
 			return nil
 		}
 		// Transfer leadership to third party.
 		r.logger.Infof("%x [term %d] starts to transfer leadership to %x", r.id, r.Term, leadTransferee)
 		// Transfer leadership should be finished in one electionTimeout, so reset r.electionElapsed.
-		r.electionElapsed = 0
-		r.leadTransferee = leadTransferee
-		if pr.Match == r.raftLog.lastIndex() {
+		r.electionElapsed = 0 // leader节点迁移操作应在electionTimeout时间内完成，所以这里要重置选举计时器
+		r.leadTransferee = leadTransferee // 记录此次迁移操作的目标节点id
+		if pr.Match == r.raftLog.lastIndex() { // 检测目标follower节点的raftLog是否与当前的leader节点完全一致
+			// 向目标follower节点发送MsgTimeoutNow消息，这会导致follower节点的选举计时器立即过期，并发起新一轮选举
 			r.sendTimeoutNow(leadTransferee)
 			r.logger.Infof("%x sends MsgTimeoutNow to %x immediately as %x already has up-to-date log", r.id, leadTransferee, leadTransferee)
 		} else {
+			// 如果raftLog中的entry记录没有完全一致，则leader节点通过发送MsgApp消息向目标节点复制
 			r.sendAppend(leadTransferee)
 		}
 	}
@@ -1404,6 +1426,7 @@ func stepCandidate(r *raft, m pb.Message) error {
 }
 
 // 当follower节点收到leader节点发送的MsgHeartbeat消息后，通过该方法进行处理，处理完后会向leader节点返回相应的MsgHeartbeatResp消息作为响应；
+// followe节点不能直接响应客户端的只读请求，而是转发给leader节点进行处理，等待leader节点响应之后，follower节点才能响应client
 func stepFollower(r *raft, m pb.Message) error {
 	switch m.Type {
 	case pb.MsgProp: // 当集群中candidate节点收到客户端发来的MsgProp消息时，直接忽略；当follower节点收到时，转发给leader
@@ -1427,10 +1450,10 @@ func stepFollower(r *raft, m pb.Message) error {
 		// 然后向leader节点发送MsgHeartbeatResp消息响应此次心跳
 		r.handleHeartbeat(m)
 	case pb.MsgSnap:
-		r.electionElapsed = 0
+		r.electionElapsed = 0 // 重置选举计时器，防止发生选举
 		r.lead = m.From
-		r.handleSnapshot(m)
-	case pb.MsgTransferLeader:
+		r.handleSnapshot(m) // 通过MsgSnap消息中的快照数据，重建当前节点的raftLog
+	case pb.MsgTransferLeader: // follower节点直接将MsgTransferLeader消息转给leader节点
 		if r.lead == None {
 			r.logger.Infof("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
 			return nil
@@ -1438,11 +1461,14 @@ func stepFollower(r *raft, m pb.Message) error {
 		m.To = r.lead
 		r.send(m)
 	case pb.MsgTimeoutNow:
-		if r.promotable() {
+		if r.promotable() { // 检测当前节点是否被移出当前集群了
 			r.logger.Infof("%x [term %d] received MsgTimeoutNow from %x and starts an election to get leadership.", r.id, r.Term, m.From)
 			// Leadership transfers never use pre-vote even if r.preVote is true; we
 			// know we are not recovering from a partition so there is no need for the
 			// extra round trip.
+			// 即使当前集群开启了pre-vote模式，目标follower节点也会直接发起新一轮选举；
+			// 注意目标follower节点在处理该消息时，调用的campaign方法的入参是campaignTransfer，该参数会被记录到MsgVote消息中并发送到集群的其他节点，
+			// 其他节点在处理MsgVote消息时，会根据该标识立即参与此次选举；
 			r.campaign(campaignTransfer)
 		} else {
 			r.logger.Infof("%x received MsgTimeoutNow from %x but is not promotable", r.id, m.From)
@@ -1453,12 +1479,14 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		m.To = r.lead
-		r.send(m)
+		r.send(m) // 将MsgReadIndex消息转发给当前的leader节点
 	case pb.MsgReadIndexResp:
+		// 检测MsgReadIndexResp消息的合法性
 		if len(m.Entries) != 1 {
 			r.logger.Errorf("%x invalid format of MsgReadIndexResp from %x, entries count: %d", r.id, m.From, len(m.Entries))
 			return nil
 		}
+		// 将MsgReadIndex消息对应的消息id以及已提交位置(raftLog-committed)封装成readState实例，并添加到readStates中，等待其他goroutine处理
 		r.readStates = append(r.readStates, ReadState{Index: m.Index, RequestCtx: m.Entries[0].Data})
 	}
 	return nil
@@ -1496,10 +1524,12 @@ func (r *raft) handleHeartbeat(m pb.Message) {
 }
 
 func (r *raft) handleSnapshot(m pb.Message) {
-	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
-	if r.restore(m.Snapshot) {
+	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term // 获取快照数据的元数据
+	if r.restore(m.Snapshot) { // 返回值表示是否通过快照数据进行了重建
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
+		// 向leader节点返回MsgAppResp消息（reject始终为false）；
+		// 该MsgAppResp消息作为MsgSnap消息的回应，与前边介绍的MsgApp消息无差别
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
 	} else {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
@@ -1511,7 +1541,9 @@ func (r *raft) handleSnapshot(m pb.Message) {
 // restore recovers the state machine from a snapshot. It restores the log and the
 // configuration of state machine. If this method returns false, the snapshot was
 // ignored, either because it was obsolete or because of an error.
+// 会调用raftLog中的相应方法进行检测和重建
 func (r *raft) restore(s pb.Snapshot) bool {
+	// 根据快照数据的元数据查找匹配的entry记录，如果存在，则表示当前节点已经拥有了该快照中的全部数据，则无须进行后续的重建
 	if s.Metadata.Index <= r.raftLog.committed {
 		return false
 	}
@@ -1555,15 +1587,18 @@ func (r *raft) restore(s pb.Snapshot) bool {
 	// Now go ahead and actually restore.
 
 	if r.raftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
+		// 快照中全部的entry记录都已经提交了，所以尝试修改当前节点的raftLog-committed（只增不减）
 		r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
 		r.raftLog.commitTo(s.Metadata.Index)
 		return false
 	}
 
+	// 通过raftLog-unstable记录该快照数据，同时重置相关字段
 	r.raftLog.restore(s)
 
 	// Reset the configuration and add the (potentially updated) peers in anew.
+	// 清空prs，并根据快照的元数据进行重建
 	r.prs = tracker.MakeProgressTracker(r.prs.MaxInflight)
 	cfg, prs, err := confchange.Restore(confchange.Changer{
 		Tracker:   r.prs,
