@@ -218,6 +218,8 @@ func (p *ProgressTracker) QuorumActive() bool {
 		if pr.IsLearner {
 			return
 		}
+		// 检测集群中其他节点的recentActive，当leader节点收到follower节点的MsgAppResp消息时，会将其对应的recentActive字段设置为true；
+		// 在MsgBeatResp消息处理中，也有类似操作，因此可以直接通过recentActive字段判断对应follower节点的联通性
 		votes[id] = pr.RecentActive
 	})
 

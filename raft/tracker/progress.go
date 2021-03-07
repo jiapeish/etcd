@@ -73,6 +73,7 @@ type Progress struct {
 	// When a leader receives a reply, the previous inflights should
 	// be freed by calling inflights.FreeLE with the index of the last
 	// received entry.
+	// 记录当前节点已发出但未收到响应的MsgApp消息
 	Inflights *Inflights
 
 	// IsLearner is true if this progress is tracked for a learner.
@@ -169,30 +170,37 @@ func (pr *Progress) OptimisticUpdate(n uint64) { pr.Next = n + 1 }
 //
 // If the rejection is genuine, Next is lowered sensibly, and the Progress is
 // cleared for sending log entries.
+// 根据对应progress状态和MsgAppResp消息携带的提示信息，完成progress-next的更新
+// 该方法的2个参数都是MsgAppResp消息携带的信息：
+// reject是被拒绝MsgApp消息的index字段值，last是被拒绝MsgAppResp消息的rejectHint字段值(即对应follower节点raftLog中最后一条entry记录的索引）
 func (pr *Progress) MaybeDecrTo(rejected, last uint64) bool {
 	if pr.State == StateReplicate {
 		// The rejection must be stale if the progress has matched and "rejected"
 		// is smaller than "match".
+		// 出现过时的MsgAppResp消息，忽略掉
 		if rejected <= pr.Match {
 			return false
 		}
 		// Directly decrease next to match + 1.
 		//
 		// TODO(tbg): why not use last if it's larger?
+		// 根据前边对MsgApp消息发送过程的分析，处于stateReplicate状态时，发送MsgApp消息的同时会直接调用optimisticUpdate方法增加next，
+		// 这就使得next可能会比match大很多，所以在这里回退next到match位置，并在后边重新发送MsgApp消息进行尝试
 		pr.Next = pr.Match + 1
 		return true
 	}
 
 	// The rejection must be stale if "rejected" does not match next - 1. This
 	// is because non-replicating followers are probed one entry at a time.
-	if pr.Next-1 != rejected {
+	if pr.Next-1 != rejected { // 出现过时的MsgAppResp消息，忽略掉
 		return false
 	}
 
+	// 根据MsgAppResp消息携带的信息重置next
 	if pr.Next = min(rejected, last+1); pr.Next < 1 {
 		pr.Next = 1
 	}
-	pr.ProbeSent = false
+	pr.ProbeSent = false // next重置完成，恢复消息发送，并在后边重新发送MsgApp消息
 	return true
 }
 
@@ -207,9 +215,9 @@ func (pr *Progress) IsPaused() bool {
 	case StateProbe:
 		return pr.ProbeSent
 	case StateReplicate:
-		return pr.Inflights.Full()
+		return pr.Inflights.Full() // 检测已发送未响应的消息个数
 	case StateSnapshot:
-		return true
+		return true // 一直可发送消息
 	default:
 		panic("unexpected state")
 	}
