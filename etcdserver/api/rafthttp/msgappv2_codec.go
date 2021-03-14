@@ -161,7 +161,7 @@ type msgAppV2Decoder struct {
 }
 
 func newMsgAppV2Decoder(r io.Reader, local, remote types.ID) *msgAppV2Decoder {
-	return &msgAppV2Decoder{
+	return &msgAppV2Decoder{ // 主要负责从连接中读取数据
 		r:         r,
 		local:     local,
 		remote:    remote,

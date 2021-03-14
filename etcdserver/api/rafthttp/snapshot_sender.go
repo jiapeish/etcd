@@ -42,7 +42,7 @@ type snapshotSender struct {
 	cid      types.ID
 
 	tr     *Transport
-	picker *urlPicker
+	picker *urlPicker // 获取对端节点可用的url
 	status *peerStatus
 	r      Raft
 	errorc chan error
@@ -72,10 +72,11 @@ func (s *snapshotSender) send(merged snap.Message) {
 	m := merged.Message
 	to := types.ID(m.To).String()
 
-	body := createSnapBody(s.tr.Logger, merged)
+	body := createSnapBody(s.tr.Logger, merged) // 根据传入的message实例创建请求的body
 	defer body.Close()
 
-	u := s.picker.pick()
+	u := s.picker.pick() // 选择对端节点可用的url
+	// 创建请求，这里请求的路径是"/raft/snapshot"，而pipeline发出的请求路径是"/raft"
 	req := createPostRequest(u, RaftSnapshotPrefix, body, "application/octet-stream", s.tr.URLs, s.from, s.cid)
 
 	snapshotTotalSizeVal := uint64(merged.TotalSize)
@@ -97,9 +98,12 @@ func (s *snapshotSender) send(merged snap.Message) {
 		snapshotSendInflights.WithLabelValues(to).Dec()
 	}()
 
-	err := s.post(req)
+	err := s.post(req) // 发送请求
 	defer merged.CloseWithError(err)
 	if err != nil {
+		// 异常处理过程与pipeline实现类似，会将此次请求的url设置为不可用，
+		// 然后调用report-unreachable方法通知底层的raft模块对端节点不可达，
+		// 并调用report-snapshot方法将此次发送失败的信息通知底层raft模块
 		if s.tr.Logger != nil {
 			s.tr.Logger.Warn(
 				"failed to send database snapshot",
@@ -131,7 +135,7 @@ func (s *snapshotSender) send(merged snap.Message) {
 		return
 	}
 	s.status.activate()
-	s.r.ReportSnapshot(m.To, raft.SnapshotFinish)
+	s.r.ReportSnapshot(m.To, raft.SnapshotFinish) // 通知底层raft模块此次成功发送快照数据
 
 	if s.tr.Logger != nil {
 		s.tr.Logger.Info(
@@ -152,6 +156,7 @@ func (s *snapshotSender) send(merged snap.Message) {
 
 // post posts the given request.
 // It returns nil when request is sent out and processed successfully.
+// 真正完成快照数据发送的地方
 func (s *snapshotSender) post(req *http.Request) (err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
@@ -162,27 +167,27 @@ func (s *snapshotSender) post(req *http.Request) (err error) {
 		body []byte
 		err  error
 	}
-	result := make(chan responseAndError, 1)
+	result := make(chan responseAndError, 1) // 该通道用于返回该请求对应的响应或异常信息
 
-	go func() {
-		resp, err := s.tr.pipelineRt.RoundTrip(req)
+	go func() { // 启动一个goroutine用于发送请求并读取响应
+		resp, err := s.tr.pipelineRt.RoundTrip(req) // 发送请求
 		if err != nil {
-			result <- responseAndError{resp, nil, err}
+			result <- responseAndError{resp, nil, err} // 将异常写入result通道
 			return
 		}
 
 		// close the response body when timeouts.
 		// prevents from reading the body forever when the other side dies right after
 		// successfully receives the request body.
-		time.AfterFunc(snapResponseReadTimeout, func() { httputil.GracefulClose(resp) })
-		body, err := ioutil.ReadAll(resp.Body)
-		result <- responseAndError{resp, body, err}
+		time.AfterFunc(snapResponseReadTimeout, func() { httputil.GracefulClose(resp) }) // 超时处理
+		body, err := ioutil.ReadAll(resp.Body) // 读取响应数据
+		result <- responseAndError{resp, body, err} // 封装响应数据，并写入result通道
 	}()
 
 	select {
 	case <-s.stopc:
 		return errStopped
-	case r := <-result:
+	case r := <-result: // 读取result通道，获取响应信息
 		if r.err != nil {
 			return r.err
 		}

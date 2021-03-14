@@ -136,17 +136,19 @@ type Transport struct {
 
 func (t *Transport) Start() error {
 	var err error
+	// 注意stream消息的超时时间配置：读写5s，keepalive 30s
 	t.streamRt, err = newStreamRoundTripper(t.TLSInfo, t.DialTimeout)
 	if err != nil {
 		return err
 	}
+	// pipeline消息的读写请求用不过期
 	t.pipelineRt, err = NewRoundTripper(t.TLSInfo, t.DialTimeout)
 	if err != nil {
 		return err
 	}
 	t.remotes = make(map[types.ID]*remote)
 	t.peers = make(map[types.ID]Peer)
-	t.pipelineProber = probing.NewProber(t.pipelineRt)
+	t.pipelineProber = probing.NewProber(t.pipelineRt) // prober实例用于探测pipeline消息通道是否可用
 	t.streamProber = probing.NewProber(t.streamRt)
 
 	// If client didn't provide dial retry frequency, use the default
@@ -182,22 +184,22 @@ func (t *Transport) Send(msgs []raftpb.Message) {
 			// ignore intentionally dropped message
 			continue
 		}
-		to := types.ID(m.To)
+		to := types.ID(m.To) // 根据message中的to获取目标节点对应的peer实例
 
 		t.mu.RLock()
 		p, pok := t.peers[to]
 		g, rok := t.remotes[to]
 		t.mu.RUnlock()
 
-		if pok {
+		if pok { // 首先尝试使用目标节点对应的peer实例发送消息
 			if m.Type == raftpb.MsgApp {
-				t.ServerStats.SendAppendReq(m.Size())
+				t.ServerStats.SendAppendReq(m.Size()) // 统计信息
 			}
 			p.send(m)
 			continue
 		}
 
-		if rok {
+		if rok { // 没有peer，则尝试使用对应的remote实例发送消息
 			g.send(m)
 			continue
 		}
@@ -300,6 +302,7 @@ func (t *Transport) AddRemote(id types.ID, us []string) {
 	}
 }
 
+// 创建并启动节点的peer实例
 func (t *Transport) AddPeer(id types.ID, us []string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -307,7 +310,7 @@ func (t *Transport) AddPeer(id types.ID, us []string) {
 	if t.peers == nil {
 		panic("transport stopped")
 	}
-	if _, ok := t.peers[id]; ok {
+	if _, ok := t.peers[id]; ok { // 是否已经与指定id的节点建立了链接
 		return
 	}
 	urls, err := types.NewURLs(us)
@@ -319,7 +322,8 @@ func (t *Transport) AddPeer(id types.ID, us []string) {
 		}
 	}
 	fs := t.LeaderStats.Follower(id.String())
-	t.peers[id] = startPeer(t, urls, id, fs)
+	t.peers[id] = startPeer(t, urls, id, fs) // 创建指定节点对应的peer实例,其中有stream消息通道和pipeline消息通道
+	// 由prober向对应节点发送探测消息，检测对端健康状况
 	addPeerToProber(t.Logger, t.pipelineProber, id.String(), us, RoundTripperNameSnapshot, rttSec)
 	addPeerToProber(t.Logger, t.streamProber, id.String(), us, RoundTripperNameRaftMessage, rttSec)
 
@@ -352,7 +356,7 @@ func (t *Transport) RemoveAllPeers() {
 // the caller of this function must have the peers mutex.
 func (t *Transport) removePeer(id types.ID) {
 	if peer, ok := t.peers[id]; ok {
-		peer.stop()
+		peer.stop() // 关闭底层的连接
 	} else {
 		if t.Logger != nil {
 			t.Logger.Panic("unexpected removal of unknown remote peer", zap.String("remote-peer-id", id.String()))
@@ -362,7 +366,7 @@ func (t *Transport) removePeer(id types.ID) {
 	}
 	delete(t.peers, id)
 	delete(t.LeaderStats.Followers, id.String())
-	t.pipelineProber.Remove(id.String())
+	t.pipelineProber.Remove(id.String()) // 停止定时发送的探测消息
 	t.streamProber.Remove(id.String())
 
 	if t.Logger != nil {
@@ -391,7 +395,7 @@ func (t *Transport) UpdatePeer(id types.ID, us []string) {
 			plog.Panicf("newURLs %+v should never fail: %+v", us, err)
 		}
 	}
-	t.peers[id].update(urls)
+	t.peers[id].update(urls) // 更新对端暴露的url，同时更新探测消息发送的目标地址
 
 	t.pipelineProber.Remove(id.String())
 	addPeerToProber(t.Logger, t.pipelineProber, id.String(), us, RoundTripperNameSnapshot, rttSec)
@@ -419,6 +423,7 @@ func (t *Transport) ActiveSince(id types.ID) time.Time {
 	return time.Time{}
 }
 
+// 负责发送snap-message消息（其中封装了MsgSnap消息实例及其他相关信息）
 func (t *Transport) SendSnapshot(m snap.Message) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
