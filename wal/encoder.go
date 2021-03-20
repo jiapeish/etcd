@@ -32,12 +32,14 @@ import (
 const walPageBytes = 8 * minSectorSize
 
 type encoder struct {
-	mu sync.Mutex
+	mu sync.Mutex // 进行读写文件时，需要加锁同步
+	// 是带有缓冲区的writer，在写入时，每写满一个page大小的缓冲区，
+	// 就会自动触发一次flush操作，将数据同步刷新到磁盘上；每个page大小由wal-pagebytes指定
 	bw *ioutil.PageWriter
 
 	crc       hash.Hash32
-	buf       []byte
-	uint64buf []byte
+	buf       []byte // 日志序列化后，会暂存在该缓冲区，该缓冲区会被复用，防止每次序列化创建缓冲区带来的开销
+	uint64buf []byte // 在写入一条日志记录时，该缓冲区用来暂存一个frame长度的数据（frame由日志数据和填充数据构成）
 }
 
 func newEncoder(w io.Writer, prevCrc uint32, pageOffset int) *encoder {
@@ -59,6 +61,8 @@ func newFileEncoder(f *os.File, prevCrc uint32) (*encoder, error) {
 	return newEncoder(f, prevCrc, int(offset)), nil
 }
 
+// 该方法是真正完成日志写入功能的地方；
+// 会对日志记录进行序列化，并完成8字节对齐；
 func (e *encoder) encode(rec *walpb.Record) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -71,12 +75,13 @@ func (e *encoder) encode(rec *walpb.Record) error {
 		n    int
 	)
 
+	// 将待写入的日志记录进行序列化，如果日志记录太大，无法复用encoder-buf缓冲区，则直接序列化
 	if rec.Size() > len(e.buf) {
 		data, err = rec.Marshal()
 		if err != nil {
 			return err
 		}
-	} else {
+	} else { // 复用encoder-buf缓冲区
 		n, err = rec.MarshalTo(e.buf)
 		if err != nil {
 			return err
@@ -84,15 +89,18 @@ func (e *encoder) encode(rec *walpb.Record) error {
 		data = e.buf[:n]
 	}
 
+	// 计算序列化之后的数据长度，在encode-frame-size方法会完成8字节对齐，
+	// 将日志数据和填充数据看作一个frame，返回值是整个frame的长度及其中填充数据的长度
 	lenField, padBytes := encodeFrameSize(len(data))
+	// 将frame的长度序列化到encoder-uint64-buf数组中，然后写入文件
 	if err = writeUint64(e.bw, lenField, e.uint64buf); err != nil {
 		return err
 	}
 
 	if padBytes != 0 {
-		data = append(data, make([]byte, padBytes)...)
+		data = append(data, make([]byte, padBytes)...) // 向data中写入填充字节
 	}
-	n, err = e.bw.Write(data)
+	n, err = e.bw.Write(data) // 将data中的序列化数据写入文件
 	walWriteBytes.Add(float64(n))
 	return err
 }
