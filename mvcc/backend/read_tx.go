@@ -37,6 +37,30 @@ type ReadTx interface {
 	UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error
 }
 
+/*
+ * ┌───────────────┐          ┌─────────────┐
+ * │   readTx      │          │ txReadBuffer│
+ * │               │          │             │    embed
+ * ├───────────────┤          ├─────────────┼───────────────┐
+ * │    buf        ├─────────►│             │               │
+ * │               │          │             │               │
+ * └───────────────┘          └─────────────┘               │
+ *                                                   ┌──────▼────────┐           ┌────────────────┐
+ *                                                   │  txBuffer     │           │   bucketBuffer │
+ *                                                   ├───────────────┤           ├────────────────┤
+ *                           ┌──────────────┐        │               ├──────────►│                │
+ * ┌───────────────┐ embed   │   batchTx    │        │   buckets     │           │     buf        │
+ * │batchTxBuffered├────────►├──────────────┤        └───────▲───────┘           └────────────────┘
+ * ├───────────────┤         │              │                │
+ * │               │         └──────────────┘                │
+ * │    buf        ├──────┐                                  │
+ * └───────────────┘      │                                  │
+ *                        │  ┌──────────────┐    embed       │
+ *                        └─►│txWriteBuffer ├────────────────┘
+ *                           ├──────────────┤
+ *                           │              │
+ *                           └──────────────┘
+ */
 type readTx struct {
 	// mu protects accesses to the txReadBuffer
 	mu  sync.RWMutex
