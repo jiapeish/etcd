@@ -54,6 +54,7 @@ func (txw *txWriteBuffer) putSeq(bucket, k, v []byte) {
 	b.add(k, v)
 }
 
+// 将当前tx-write-buffer中键值对合并到指定对tr-read-buffer中，达到更新只读事务缓存的效果
 func (txw *txWriteBuffer) writeback(txr *txReadBuffer) {
 	for k, wb := range txw.buckets {
 		rb, ok := txr.buckets[k]

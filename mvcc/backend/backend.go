@@ -186,7 +186,7 @@ func newBackend(bcfg BackendConfig) *backend {
 		lg: bcfg.Logger,
 	}
 	b.batchTx = newBatchTxBuffered(b)
-	go b.run()
+	go b.run() // 启动一个单独的goroutine，其中会定时提交当前的批量读写事务，并开启新的批量读写事务
 	return b
 }
 
