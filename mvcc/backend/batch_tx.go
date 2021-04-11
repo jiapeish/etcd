@@ -25,14 +25,20 @@ import (
 	"go.uber.org/zap"
 )
 
+// 对批量读写事务的抽象
 type BatchTx interface {
-	ReadTx
-	UnsafeCreateBucket(name []byte)
+	ReadTx // 内嵌对只读事务的抽象接口
+	UnsafeCreateBucket(name []byte) // 创建bucket
 	UnsafePut(bucketName []byte, key []byte, value []byte)
+	// 向指定bucket中添加键值对，与unsafe-put方法的区别是，
+	// 该方法会将对应bucket实例的填充比例设置为90%，这样可以在顺序写入时，提高bucket利用率
 	UnsafeSeqPut(bucketName []byte, key []byte, value []byte)
+	// 在指定bucket中删除指定的键值对
 	UnsafeDelete(bucketName []byte, key []byte)
+	// 提交当前的读写事务，之后立即打开一个新的读写事务
 	// Commit commits a previous tx and begins a new writable one.
 	Commit()
+	// 提交当前的读写事务，之后不会打开新的读写事务
 	// CommitAndStop commits the previous tx and does not create a new one.
 	CommitAndStop()
 }
