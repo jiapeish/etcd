@@ -186,6 +186,7 @@ type Server interface {
 // EtcdServer is the production implementation of the Server interface
 type EtcdServer struct {
 	// inflightSnapshots holds count the number of snapshots currently inflight.
+	// 当前已发送出去但未收到响应但快照个数.
 	inflightSnapshots int64  // must use atomic operations to access; keep 64-bit aligned.
 	appliedIndex      uint64 // must use atomic operations to access; keep 64-bit aligned.
 	committedIndex    uint64 // must use atomic operations to access; keep 64-bit aligned.
@@ -195,8 +196,10 @@ type EtcdServer struct {
 	// consistIndex used to hold the offset of current executing entry
 	// It is initialized to 0 before executing any entry.
 	consistIndex consistentIndex // must use atomic operations to access; keep 64-bit aligned.
-	r            raftNode        // uses 64-bit atomics; keep 64-bit aligned.
+	r            raftNode        // uses 64-bit atomics; keep 64-bit aligned. // 是etcd-server实例与底层etcd-raft模块通信的桥梁
 
+	// 当前节点将自身的信息推送到集群中其他节点之后，会将该通道关闭；
+	// 也作为当前etcd-server实例可以对外提供服务的一个信号
 	readych chan struct{}
 	Cfg     ServerConfig
 
@@ -208,6 +211,7 @@ type EtcdServer struct {
 	readMu sync.RWMutex
 	// read routine notifies etcd server that it waits for reading by sending an empty struct to
 	// readwaitC
+	// 主要用来协调linearized read 相关的goroutine
 	readwaitc chan struct{}
 	// readNotifier is used to notify the read routine that it can process the request
 	// when there is no error
@@ -235,6 +239,7 @@ type EtcdServer struct {
 	applyV2 ApplierV2
 
 	// applyV3 is the applier with auth and quotas
+	// 应用v3版本的entry记录，底层封装了v3存储
 	applyV3 applierV3
 	// applyV3Base is the core applier without auth or quotas
 	applyV3Base applierV3
@@ -243,20 +248,21 @@ type EtcdServer struct {
 	kv         mvcc.ConsistentWatchableKV
 	lessor     lease.Lessor
 	bemu       sync.Mutex
-	be         backend.Backend
-	authStore  auth.AuthStore
-	alarmStore *v3alarm.AlarmStore
+	be         backend.Backend // v3版本的后端存储（其中支持watch机制）
+	authStore  auth.AuthStore // 在v3存储之上封装的一层存储，用于记录权限控制相关的信息
+	alarmStore *v3alarm.AlarmStore // 在v3存储之上封装的一层存储，用于记录报警相关的信息
 
 	stats  *stats.ServerStats
 	lstats *stats.LeaderStats
 
-	SyncTicker *time.Ticker
+	SyncTicker *time.Ticker // 用于控制leader节点定期发送sync消息的频率
 	// compactor is used to auto-compact the KV.
+	// leader节点会对存储进行定期压缩，该字段用于控制定期压缩的频率
 	compactor v3compactor.Compactor
 
 	// peerRt used to send requests (version, lease) to peers.
 	peerRt   http.RoundTripper
-	reqIDGen *idutil.Generator
+	reqIDGen *idutil.Generator // 用于生成请求的唯一标识
 
 	// forceVersionC is used to force the version monitor loop
 	// to detect the cluster version immediately.
@@ -266,6 +272,7 @@ type EtcdServer struct {
 	wgMu sync.RWMutex
 	// wg is used to wait for the go routines that depends on the server state
 	// to exit when stopping the server.
+	// 在etcd-server-stop方法中会通过该字段等待所有的后台goroutine全部退出
 	wg sync.WaitGroup
 
 	// ctx is used for etcd-initiated requests that may need to be canceled
@@ -274,7 +281,7 @@ type EtcdServer struct {
 	cancel context.CancelFunc
 
 	leadTimeMu      sync.RWMutex
-	leadElectedTime time.Time
+	leadElectedTime time.Time // 记录当前节点最近一次转换成leader状态的时间戳
 
 	*AccessController
 }
@@ -345,6 +352,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 	)
 
 	switch {
+	// 没有wal日志文件且当前节点正在加入一个正在运行的集群
 	case !haveWAL && !cfg.NewCluster:
 		if err = cfg.VerifyJoinExisting(); err != nil {
 			return nil, err
@@ -371,6 +379,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		id, n, s, w = startNode(cfg, cl, nil)
 		cl.SetID(id, existingCluster.ID())
 
+	// 没有wal日志文件且当前集群是新建的
 	case !haveWAL && cfg.NewCluster:
 		if err = cfg.VerifyBootstrap(); err != nil {
 			return nil, err
@@ -406,6 +415,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		id, n, s, w = startNode(cfg, cl, cl.MemberIDs())
 		cl.SetID(id, cl.ID())
 
+	// 存在wal日志文件
 	case haveWAL:
 		if err = fileutil.IsDirWriteable(cfg.MemberDir()); err != nil {
 			return nil, fmt.Errorf("cannot write to member directory: %v", err)
@@ -502,7 +512,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 	lstats := stats.NewLeaderStats(id.String())
 
 	heartbeat := time.Duration(cfg.TickMs) * time.Millisecond
-	srv = &EtcdServer{
+	srv = &EtcdServer{ // 创建etcd-server实例
 		readych:     make(chan struct{}),
 		Cfg:         cfg,
 		lgMu:        new(sync.RWMutex),
@@ -510,7 +520,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		errorc:      make(chan error, 1),
 		v2store:     st,
 		snapshotter: ss,
-		r: *newRaftNode(
+		r: *newRaftNode( // 根据前边创建的各个组件创建etcd-server-raft-node实例
 			raftNodeConfig{
 				lg:          cfg.Logger,
 				isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
@@ -540,6 +550,8 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 
 	// always recover lessor before kv. When we recover the mvcc.KV it will reattach keys to its leases.
 	// If we recover mvcc.KV first, it will attach the keys to the wrong lessor before it recovers.
+	// 因为在store-restore方法中，除了恢复内存索引，还会重新绑定键值对到对应的lease，
+	// 所以需要先恢复etcd-server-lessor，再恢复etcd-server-kv字段
 	srv.lessor = lease.NewLessor(
 		srv.getLogger(),
 		srv.be,
@@ -567,7 +579,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 
 	srv.kv = mvcc.New(srv.getLogger(), srv.be, srv.lessor, srv.authStore, &srv.consistIndex, mvcc.StoreConfig{CompactionBatchLimit: cfg.CompactionBatchLimit})
 	if beExist {
-		kvindex := srv.kv.ConsistentIndex()
+		kvindex := srv.kv.ConsistentIndex() // 根据consistent-index检测当前的backend实例是否可用
 		// TODO: remove kvindex != 0 checking when we do not expect users to upgrade
 		// etcd from pre-3.0 release.
 		if snapshot != nil && kvindex < snapshot.Metadata.Index {
@@ -595,6 +607,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 
 	srv.consistIndex.setConsistentIndex(srv.kv.ConsistentIndex())
 	if num := cfg.AutoCompactionRetention; num != 0 {
+		// 启动后台goroutine，进行自动压缩
 		srv.compactor, err = v3compactor.New(cfg.Logger, cfg.AutoCompactionMode, num, srv.kv, srv)
 		if err != nil {
 			return nil, err
@@ -602,8 +615,8 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		srv.compactor.Run()
 	}
 
-	srv.applyV3Base = srv.newApplierV3Backend()
-	if err = srv.restoreAlarms(); err != nil {
+	srv.applyV3Base = srv.newApplierV3Backend() // 初始化apply-v3-base字段
+	if err = srv.restoreAlarms(); err != nil { // 初始化alarm-store字段以及apply-v3字段
 		return nil, err
 	}
 
@@ -615,24 +628,27 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 	}
 
 	// TODO: move transport initialization near the definition of remote
-	tr := &rafthttp.Transport{
+	tr := &rafthttp.Transport{ // 创建transport实例
 		Logger:      cfg.Logger,
 		TLSInfo:     cfg.PeerTLSInfo,
 		DialTimeout: cfg.peerDialTimeout(),
 		ID:          id,
 		URLs:        cfg.PeerURLs,
 		ClusterID:   cl.ID(),
+		// 这里传入的rafthttp-raft接口的实现是etcd-server实例；
+		// etcd-server对raft接口的实现比较简单，它会直接将调用委托给底层的raft-node实例;
+		//
 		Raft:        srv,
 		Snapshotter: ss,
 		ServerStats: sstats,
 		LeaderStats: lstats,
 		ErrorC:      srv.errorc,
 	}
-	if err = tr.Start(); err != nil {
+	if err = tr.Start(); err != nil { // 启动rafthttp-transport实例
 		return nil, err
 	}
 	// add all remotes into transport
-	for _, m := range remotes {
+	for _, m := range remotes { // 向rafthttp-transport实例中添加集群中各个节点对应的peer实例和remote实例
 		if m.ID != id {
 			tr.AddRemote(m.ID, m.PeerURLs)
 		}
@@ -642,7 +658,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 			tr.AddPeer(m.ID, m.PeerURLs)
 		}
 	}
-	srv.r.transport = tr
+	srv.r.transport = tr // 设置raft-node-transport字段
 
 	return srv, nil
 }

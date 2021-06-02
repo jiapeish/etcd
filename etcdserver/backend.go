@@ -55,14 +55,16 @@ func newBackend(cfg ServerConfig) backend.Backend {
 
 // openSnapshotBackend renames a snapshot db to the current etcd db and opens it.
 func openSnapshotBackend(cfg ServerConfig, ss *snap.Snapshotter, snapshot raftpb.Snapshot) (backend.Backend, error) {
+	// 根据快照元数据查找对应的bolt-db数据库文件
 	snapPath, err := ss.DBFilePath(snapshot.Metadata.Index)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find database snapshot file (%v)", err)
 	}
+	// 将可用的bolt-db数据库文件移动到指定的目录中
 	if err := os.Rename(snapPath, cfg.backendPath()); err != nil {
 		return nil, fmt.Errorf("failed to rename database snapshot file (%v)", err)
 	}
-	return openBackend(cfg), nil
+	return openBackend(cfg), nil // 新建backend实例
 }
 
 // openBackend returns a backend using the current etcd db.
@@ -94,7 +96,7 @@ func openBackend(cfg ServerConfig) backend.Backend {
 		}
 	}
 
-	return <-beOpened
+	return <-beOpened // 阻塞等待backend实例初始化完成
 }
 
 // recoverBackendSnapshot recovers the DB from a snapshot in case etcd crashes
@@ -105,9 +107,11 @@ func recoverSnapshotBackend(cfg ServerConfig, oldbe backend.Backend, snapshot ra
 	var cIndex consistentIndex
 	kv := mvcc.New(cfg.Logger, oldbe, &lease.FakeLessor{}, nil, &cIndex, mvcc.StoreConfig{CompactionBatchLimit: cfg.CompactionBatchLimit})
 	defer kv.Close()
+	// 检测之前创建的backend实例是否可用（包含了snapshot所包含的全部entry记录），如果可用则继续使用；
 	if snapshot.Metadata.Index <= kv.ConsistentIndex() {
 		return oldbe, nil
 	}
 	oldbe.Close()
+	// 如果不可用，则根据快照的元数据查找可用的bolt-db数据库文件，并创建新的backend实例；
 	return openSnapshotBackend(cfg, snap.New(cfg.Logger, cfg.SnapDir()), snapshot)
 }

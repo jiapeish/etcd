@@ -23,6 +23,9 @@ import (
 
 // Wait is an interface that provides the ability to wait and trigger events that
 // are associated with IDs.
+// 主要负责协调多个后台goroutine的执行，在list实例中维护了一个map，
+// 可以通过register为指定的id创建一个对应的通道，id与通道的映射关系会记录在上述map中；
+// 之后可以通过trigger方法将参数x写入id对应的通道中，其他监听该通道的goroutine就可以获取该参数x.
 type Wait interface {
 	// Register waits returns a chan that waits on the given ID.
 	// The chan will be triggered when Trigger is called with

@@ -16,6 +16,9 @@ package wait
 
 import "sync"
 
+// 是对wait的一层扩展；
+// 在wait-time中记录的id是有序的，可以通过其wait方法创建指定id与通道之间的映射关系；
+// 其trigger方法会将小于指定值的id对应的通道关闭，这样就可以通知监听相应通道的goroutine了.
 type WaitTime interface {
 	// Wait returns a chan that waits on the given logical deadline.
 	// The chan will be triggered when Trigger is called with a

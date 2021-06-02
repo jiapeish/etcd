@@ -525,11 +525,13 @@ func startNode(cfg ServerConfig, cl *membership.RaftCluster, ids []types.ID) (id
 	return id, n, s, w
 }
 
+// 根据配置信息和加载的快照数据，重启etcd-raft模块的node实例
 func restartNode(cfg ServerConfig, snapshot *raftpb.Snapshot) (types.ID, *membership.RaftCluster, raft.Node, *raft.MemoryStorage, *wal.WAL) {
 	var walsnap walpb.Snapshot
 	if snapshot != nil {
 		walsnap.Index, walsnap.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
 	}
+	// 根据快照的元数据，查找合适的wal日志并完成wal日志的回放
 	w, id, cid, st, ents := readWAL(cfg.Logger, cfg.WALDir(), walsnap, cfg.UnsafeNoFsync)
 
 	if cfg.Logger != nil {
@@ -544,12 +546,12 @@ func restartNode(cfg ServerConfig, snapshot *raftpb.Snapshot) (types.ID, *member
 	}
 	cl := membership.NewCluster(cfg.Logger, "")
 	cl.SetID(id, cid)
-	s := raft.NewMemoryStorage()
+	s := raft.NewMemoryStorage() // 创建memory-storage实例
 	if snapshot != nil {
-		s.ApplySnapshot(*snapshot)
+		s.ApplySnapshot(*snapshot) // 将快照数据记录到memory-storage实例中
 	}
-	s.SetHardState(st)
-	s.Append(ents)
+	s.SetHardState(st) // 根据wal日志回放的结果设置hard-state
+	s.Append(ents) // 向memory-storage实例中追加快照数据之后的entry记录
 	c := &raft.Config{
 		ID:              uint64(id),
 		ElectionTick:    cfg.ElectionTicks,
@@ -573,7 +575,7 @@ func restartNode(cfg ServerConfig, snapshot *raftpb.Snapshot) (types.ID, *member
 		}
 	}
 
-	n := raft.RestartNode(c)
+	n := raft.RestartNode(c) // 根据上边的config，重建raft-node实例
 	raftStatusMu.Lock()
 	raftStatus = n.Status
 	raftStatusMu.Unlock()
