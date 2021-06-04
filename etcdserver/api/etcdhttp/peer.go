@@ -52,10 +52,11 @@ func newPeerHandler(
 	peerMemberPromoteHandler := newPeerMemberPromoteHandler(lg, s)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", http.NotFound)
+	mux.HandleFunc("/", http.NotFound) // 使用默认的handler，直接返回404
+	// 注册transport-handler方法返回的handler
 	mux.Handle(rafthttp.RaftPrefix, raftHandler)
 	mux.Handle(rafthttp.RaftPrefix+"/", raftHandler)
-	mux.Handle(peerMembersPath, peerMembersHandler)
+	mux.Handle(peerMembersPath, peerMembersHandler) // 将上述peer members handler实例注册到members路径
 	mux.Handle(peerMemberPromotePrefix, peerMemberPromoteHandler)
 	if leaseHandler != nil {
 		mux.Handle(leasehttp.LeasePrefix, leaseHandler)
@@ -64,11 +65,13 @@ func newPeerHandler(
 	if hashKVHandler != nil {
 		mux.Handle(etcdserver.PeerHashKVPath, hashKVHandler)
 	}
-	mux.HandleFunc(versionPath, versionHandler(s.Cluster(), serveVersion))
+	mux.HandleFunc(versionPath, versionHandler(s.Cluster(), serveVersion)) // version handler，用于返回当前节点的版本信息
 	return mux
 }
 
 func newPeerMembersHandler(lg *zap.Logger, cluster api.Cluster) http.Handler {
+	// 创建peer-members-handler实例，在初始化etcd-server实例时，会从远端节点请求当前集群的信息，
+	// 而远端节点就是通过该handler对此请求进行响应的
 	return &peerMembersHandler{
 		lg:      lg,
 		cluster: cluster,

@@ -755,11 +755,11 @@ func (s *EtcdServer) adjustTicks() {
 func (s *EtcdServer) Start() {
 	s.start()
 	s.goAttach(func() { s.adjustTicks() })
-	s.goAttach(func() { s.publish(s.Cfg.ReqTimeout()) })
-	s.goAttach(s.purgeFile)
-	s.goAttach(func() { monitorFileDescriptor(s.getLogger(), s.stopping) })
-	s.goAttach(s.monitorVersions)
-	s.goAttach(s.linearizableReadLoop)
+	s.goAttach(func() { s.publish(s.Cfg.ReqTimeout()) }) // 将当前节点的信息发送到集群其他节点
+	s.goAttach(s.purgeFile) // 定期清理wal日志文件和快照文件
+	s.goAttach(func() { monitorFileDescriptor(s.getLogger(), s.stopping) }) // 监控相关功能
+	s.goAttach(s.monitorVersions) // 监控集群中其他节点的版本信息，在版本升级时使用
+	s.goAttach(s.linearizableReadLoop) // 实现linearize read功能
 	s.goAttach(s.monitorKVHash)
 }
 
@@ -944,6 +944,7 @@ type raftReadyHandler struct {
 	updateCommittedIndex func(uint64)
 }
 
+// etcd-server启动的核心流程: 启动etcd-server-raft-node实例，然后处理etcd-raft模块返回的ready实例
 func (s *EtcdServer) run() {
 	lg := s.getLogger()
 
@@ -963,6 +964,7 @@ func (s *EtcdServer) run() {
 		smu   sync.RWMutex
 		syncC <-chan time.Time
 	)
+	// 设置发送sync消息的定时器，这两个回调函数会与raft-ready-handler配合
 	setSyncC := func(ch <-chan time.Time) {
 		smu.Lock()
 		syncC = ch
@@ -977,25 +979,30 @@ func (s *EtcdServer) run() {
 	rh := &raftReadyHandler{
 		getLead:    func() (lead uint64) { return s.getLead() },
 		updateLead: func(lead uint64) { s.setLead(lead) },
+		// raft-node在处理etcd-raft模块返回的ready-soft-state字段时，
+		// 会调用raft-ready-handler的update-leadership回调，
+		// 其中会根据当前节点的状态和leader节点是否发生变化完成相应操作
 		updateLeadership: func(newLeader bool) {
 			if !s.isLeader() {
 				if s.lessor != nil {
-					s.lessor.Demote()
+					s.lessor.Demote() // 将该节点的lessor实例降级
 				}
 				if s.compactor != nil {
-					s.compactor.Pause()
+					s.compactor.Pause() // 非leader节点暂停自动压缩
 				}
-				setSyncC(nil)
+				setSyncC(nil) // 非leader节点不会发送sync消息，将该定时器设置为nil
 			} else {
 				if newLeader {
 					t := time.Now()
 					s.leadTimeMu.Lock()
+					// 如果发生leader节点的切换，且当前节点成为leader节点，则初始化该字段，
+					// 记录了当前节点最近一次当选为leader的时间
 					s.leadElectedTime = t
 					s.leadTimeMu.Unlock()
 				}
-				setSyncC(s.SyncTicker.C)
+				setSyncC(s.SyncTicker.C) // leader节点会定期发送sync消息，恢复定时器
 				if s.compactor != nil {
-					s.compactor.Resume()
+					s.compactor.Resume() // 重启自动压缩功能
 				}
 			}
 			if newLeader {
@@ -1011,6 +1018,9 @@ func (s *EtcdServer) run() {
 				s.stats.BecomeLeader()
 			}
 		},
+		// 在raft-node处理apply实例时会调用update-committed-index函数，
+		// 该函数会根据apply实例中封装的待应用entry记录和快照数据确定当前的committed-index值，
+		// 然后调用raft-ready-handler中的同名回调函数更新etcd-server-committed-index值
 		updateCommittedIndex: func(ci uint64) {
 			cci := s.getCommittedIndex()
 			if ci > cci {
@@ -1018,9 +1028,10 @@ func (s *EtcdServer) run() {
 			}
 		},
 	}
+	// 启动raft-node，其中会启动后台goroutine处理etcd-raft模块返回的ready实例
 	s.r.start(rh)
 
-	ep := etcdProgress{
+	ep := etcdProgress{ // 记录当前快照相关的元数据和已应用entry记录的位置信息
 		confState: sn.Metadata.ConfState,
 		snapi:     sn.Metadata.Index,
 		appliedt:  sn.Metadata.Term,
@@ -1071,7 +1082,7 @@ func (s *EtcdServer) run() {
 
 	for {
 		select {
-		case ap := <-s.r.apply():
+		case ap := <-s.r.apply(): // 读取raft-node apply chan 中的apply实例并进行处理
 			f := func(context.Context) { s.applyAll(&ep, &ap) }
 			sched.Schedule(f)
 		case leases := <-expiredLeaseC:
@@ -1115,9 +1126,9 @@ func (s *EtcdServer) run() {
 				plog.Infof("the data-dir used by this member must be removed.")
 			}
 			return
-		case <-getSyncC():
-			if s.v2store.HasTTLKeys() {
-				s.sync(s.Cfg.ReqTimeout())
+		case <-getSyncC(): // 定时发送sync消息
+			if s.v2store.HasTTLKeys() { // 如果v2存储中只有永久节点，则无须发送sync
+				s.sync(s.Cfg.ReqTimeout()) // 发送sync消息的目的是为了清理v2存储中的过期节点
 			}
 		case <-s.stop:
 			return
@@ -2027,7 +2038,7 @@ func (s *EtcdServer) sync(timeout time.Duration) {
 // process publish requests through rafthttp
 // TODO: Deprecate v2 store
 func (s *EtcdServer) publish(timeout time.Duration) {
-	b, err := json.Marshal(s.attributes)
+	b, err := json.Marshal(s.attributes) // 将attr 序列化为json
 	if err != nil {
 		if lg := s.getLogger(); lg != nil {
 			lg.Panic("failed to marshal JSON", zap.Error(err))
@@ -2036,7 +2047,7 @@ func (s *EtcdServer) publish(timeout time.Duration) {
 		}
 		return
 	}
-	req := pb.Request{
+	req := pb.Request{ // 将上述json封装为put请求
 		Method: "PUT",
 		Path:   membership.MemberAttributesStorePath(s.id),
 		Val:    string(b),
@@ -2048,6 +2059,8 @@ func (s *EtcdServer) publish(timeout time.Duration) {
 		cancel()
 		switch err {
 		case nil:
+			// 将当前节点信息发送到集群其他节点之后，会将ready ch关闭，
+			// 从而实现通知其他goroutine的目的（会有goroutine监听ready ch）
 			close(s.readych)
 			if lg := s.getLogger(); lg != nil {
 				lg.Info(
@@ -2658,7 +2671,7 @@ func (s *EtcdServer) goAttach(f func()) {
 	s.wgMu.RLock() // this blocks with ongoing close(s.stopping)
 	defer s.wgMu.RUnlock()
 	select {
-	case <-s.stopping:
+	case <-s.stopping: // 检测当前etcd server实例是否已经停止
 		if lg := s.getLogger(); lg != nil {
 			lg.Warn("server has stopped; skipping goAttach")
 		} else {
@@ -2669,10 +2682,10 @@ func (s *EtcdServer) goAttach(f func()) {
 	}
 
 	// now safe to add since waitgroup wait has not started yet
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		f()
+	s.wg.Add(1) // 调用etcd server stop时，需要等待该后台goroutine结束之后才返回
+	go func() { // 启动后台goroutine
+		defer s.wg.Done() // 结束时调用
+		f() // 执行传入的回调函数
 	}()
 }
 
