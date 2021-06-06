@@ -278,9 +278,10 @@ func (c *RaftCluster) Recover(onSet func(*zap.Logger, *semver.Version)) {
 
 // ValidateConfigurationChange takes a proposed ConfChange and
 // ensures that it is still valid.
+// 检测待修改的节点信息是否合法：如新增节点的url是否与集群中现有节点的url冲突，待删除节点是否存在；
 func (c *RaftCluster) ValidateConfigurationChange(cc raftpb.ConfChange) error {
 	members, removed := membersFromStore(c.lg, c.v2store)
-	id := types.ID(cc.NodeID)
+	id := types.ID(cc.NodeID) // 从conf-change实例中获取待操作的节点id
 	if removed[id] {
 		return ErrIDRemoved
 	}
@@ -303,17 +304,17 @@ func (c *RaftCluster) ValidateConfigurationChange(cc raftpb.ConfChange) error {
 				return ErrMemberNotLearner
 			}
 		} else { // adding a new member
-			if members[id] != nil {
+			if members[id] != nil { // 检测新增节点是否在member中，存在则返回错误
 				return ErrIDExists
 			}
 
 			urls := make(map[string]bool)
-			for _, m := range members {
+			for _, m := range members { // 遍历当前集群中全部的member实例，并将每个节点暴露的url记录到map中
 				for _, u := range m.PeerURLs {
 					urls[u] = true
 				}
 			}
-			for _, u := range confChangeContext.Member.PeerURLs {
+			for _, u := range confChangeContext.Member.PeerURLs { // 检测新增节点提供的url是否与集群中已有节点提供的url地址冲突
 				if urls[u] {
 					return ErrPeerURLexists
 				}
@@ -332,12 +333,12 @@ func (c *RaftCluster) ValidateConfigurationChange(cc raftpb.ConfChange) error {
 			}
 		}
 	case raftpb.ConfChangeRemoveNode:
-		if members[id] == nil {
+		if members[id] == nil { // 检测待删除节点是否存在于member中
 			return ErrIDNotFound
 		}
 
 	case raftpb.ConfChangeUpdateNode:
-		if members[id] == nil {
+		if members[id] == nil { // 检测待更新节点是否存在于member中
 			return ErrIDNotFound
 		}
 		urls := make(map[string]bool)
@@ -357,7 +358,7 @@ func (c *RaftCluster) ValidateConfigurationChange(cc raftpb.ConfChange) error {
 				plog.Panicf("unmarshal member should never fail: %v", err)
 			}
 		}
-		for _, u := range m.PeerURLs {
+		for _, u := range m.PeerURLs { // 检测节点更新之后提供的url是否与集群中其他节点提供的url冲突
 			if urls[u] {
 				return ErrPeerURLexists
 			}

@@ -258,7 +258,7 @@ func (s *EtcdServer) LeaseGrant(ctx context.Context, r *pb.LeaseGrantRequest) (*
 }
 
 func (s *EtcdServer) LeaseRevoke(ctx context.Context, r *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error) {
-	resp, err := s.raftRequestOnce(ctx, pb.InternalRaftRequest{LeaseRevoke: r})
+	resp, err := s.raftRequestOnce(ctx, pb.InternalRaftRequest{LeaseRevoke: r}) // 将lease-revoke-request请求消息封装成msg-prop消息，并发送到集群中的其他节点
 	if err != nil {
 		return nil, err
 	}
@@ -609,15 +609,15 @@ func (s *EtcdServer) doSerialize(ctx context.Context, chk func(*auth.AuthInfo) e
 func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.InternalRaftRequest) (*applyResult, error) {
 	ai := s.getAppliedIndex()
 	ci := s.getCommittedIndex()
-	if ci > ai+maxGapBetweenApplyAndCommitIndex {
+	if ci > ai+maxGapBetweenApplyAndCommitIndex { // 检测当前是否有大量已提交但未应用的entry记录，如果有，则返回错误实现限流
 		return nil, ErrTooManyRequests
 	}
 
 	r.Header = &pb.RequestHeader{
-		ID: s.reqIDGen.Next(),
+		ID: s.reqIDGen.Next(), // 为请求生成id
 	}
 
-	authInfo, err := s.AuthInfoFromCtx(ctx)
+	authInfo, err := s.AuthInfoFromCtx(ctx) // 获取权限信息，记录到请求头中
 	if err != nil {
 		return nil, err
 	}
@@ -626,7 +626,7 @@ func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.In
 		r.Header.AuthRevision = authInfo.Revision
 	}
 
-	data, err := r.Marshal()
+	data, err := r.Marshal() // 将internal-raft-request请求序列化
 	if err != nil {
 		return nil, err
 	}
@@ -639,12 +639,13 @@ func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.In
 	if id == 0 {
 		id = r.Header.ID
 	}
-	ch := s.w.Register(id)
+	ch := s.w.Register(id) // 在etcd-server-wait中为该请求注册响应的ch通道
 
 	cctx, cancel := context.WithTimeout(ctx, s.Cfg.ReqTimeout())
 	defer cancel()
 
 	start := time.Now()
+	// 将internal-raft-request序列化后的数据封装成entry，之后生成msg-prop消息并发送出去
 	err = s.r.Propose(cctx, data)
 	if err != nil {
 		proposalsFailed.Inc()
@@ -655,7 +656,7 @@ func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.In
 	defer proposalsPending.Dec()
 
 	select {
-	case x := <-ch:
+	case x := <-ch: // 阻塞等待上边发送的entry被应用
 		return x.(*applyResult), nil
 	case <-cctx.Done():
 		proposalsFailed.Inc()

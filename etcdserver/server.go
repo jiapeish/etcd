@@ -1086,17 +1086,17 @@ func (s *EtcdServer) run() {
 			f := func(context.Context) { s.applyAll(&ep, &ap) } // 调用apply all方法处理从中读取到的apply实例(封装了待应用的entry记录、待应用的快照数据和notify channel)
 			sched.Schedule(f)
 		case leases := <-expiredLeaseC:
-			s.goAttach(func() {
+			s.goAttach(func() { // 启动单独的goroutine
 				// Increases throughput of expired leases deletion process through parallelization
-				c := make(chan struct{}, maxPendingRevokes)
-				for _, lease := range leases {
+				c := make(chan struct{}, maxPendingRevokes) // 用于限流
+				for _, lease := range leases { // 遍历过期的lease实例
 					select {
 					case c <- struct{}{}:
 					case <-s.stopping:
 						return
 					}
 					lid := lease.ID
-					s.goAttach(func() {
+					s.goAttach(func() { // 启动单独的goroutine，完成指定lease的撤销
 						ctx := s.authStore.WithRoot(s.ctx)
 						_, lerr := s.LeaseRevoke(ctx, &pb.LeaseRevokeRequest{ID: int64(lid)})
 						if lerr == nil {
@@ -1126,7 +1126,7 @@ func (s *EtcdServer) run() {
 				plog.Infof("the data-dir used by this member must be removed.")
 			}
 			return
-		case <-getSyncC(): // 定时发送sync消息
+		case <-getSyncC(): // 定时发送sync消息（其主要作用是定义通知节点，清理过期v2存储中的过期节点）
 			if s.v2store.HasTTLKeys() { // 如果v2存储中只有永久节点，则无须发送sync
 				s.sync(s.Cfg.ReqTimeout()) // 发送sync消息的目的是为了清理v2存储中的过期节点
 			}
@@ -1138,20 +1138,26 @@ func (s *EtcdServer) run() {
 
 func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply) {
 	s.applySnapshot(ep, apply) // 处理apply实例中的快照数据
-	s.applyEntries(ep, apply)
+	s.applyEntries(ep, apply) // 处理apply实例中的entry记录
 
 	proposalsApplied.Set(float64(ep.appliedi))
+	// etcd-progress-appliedi记录了已应用entry的索引值；
+	// 这里将id小于etcd-progress-appliedi的entry对应的通道全部关闭，从而通知其他监听该channel的goroutine，如linearizable-readloop goroutine
 	s.applyWait.Trigger(ep.appliedi)
 
 	// wait for the raft routine to finish the disk writes before triggering a
 	// snapshot. or applied index might be greater than the last index in raft
 	// storage, since the raft routine might be slower than apply routine.
+	// 当ready处理完时，会向notify c通道中写入一个信号，通知当前goroutine去检测是否需要生成快照
 	<-apply.notifyc
 
-	s.triggerSnapshot(ep)
+	s.triggerSnapshot(ep) // 根据当前状态决定是否生成快照
 	select {
 	// snapshot requested via send()
-	case m := <-s.r.msgSnapC:
+	// 在raft-node中处理ready实例时，如果没有直接发送msg-snap消息，而是将其写入了msg-snap-c通道中，
+	// 这里会读取msg-snap-c通道，并完成快照数据的发送
+	case m := <-s.r.msgSnapC: // 处理msg-snap消息
+		// 将v2存储的快照数据和v3存储的快照数据合并成完整的快照数据
 		merged := s.createMergedSnapshotMessage(m, ep.appliedt, ep.appliedi, ep.confState)
 		s.sendMergedSnap(merged)
 	default:
@@ -1430,7 +1436,7 @@ func (s *EtcdServer) applyEntries(ep *etcdProgress, apply *apply) {
 }
 
 func (s *EtcdServer) triggerSnapshot(ep *etcdProgress) {
-	if ep.appliedi-ep.snapi <= s.Cfg.SnapshotCount {
+	if ep.appliedi-ep.snapi <= s.Cfg.SnapshotCount { // 连续应用一定量的entry记录，会触发快照的生成
 		return
 	}
 
@@ -1446,8 +1452,8 @@ func (s *EtcdServer) triggerSnapshot(ep *etcdProgress) {
 		plog.Infof("start to snapshot (applied: %d, lastsnap: %d)", ep.appliedi, ep.snapi)
 	}
 
-	s.snapshot(ep.appliedi, ep.confState)
-	ep.snapi = ep.appliedi
+	s.snapshot(ep.appliedi, ep.confState) // 创建新的快照文件
+	ep.snapi = ep.appliedi // 更新etcd-progress-snapi
 }
 
 func (s *EtcdServer) hasMultipleVotingMembers() bool {
@@ -2117,8 +2123,9 @@ func (s *EtcdServer) publish(timeout time.Duration) {
 	}
 }
 
+// 将snap-message实例发送到指定节点
 func (s *EtcdServer) sendMergedSnap(merged snap.Message) {
-	atomic.AddInt64(&s.inflightSnapshots, 1)
+	atomic.AddInt64(&s.inflightSnapshots, 1) // 递增该变量，表示已发送但未收到响应的快照消息个数
 
 	lg := s.getLogger()
 	fields := []zap.Field{
@@ -2129,12 +2136,13 @@ func (s *EtcdServer) sendMergedSnap(merged snap.Message) {
 	}
 
 	now := time.Now()
+	// 发送snap-message消息，底层会启动单独的后台goroutine，通过snapshot-sender完成发送
 	s.r.transport.SendSnapshot(merged)
 	if lg != nil {
 		lg.Info("sending merged snapshot", fields...)
 	}
 
-	s.goAttach(func() {
+	s.goAttach(func() { // 启动一个后台goroutine监听该快照数据是否发送完成
 		select {
 		case ok := <-merged.CloseNotify():
 			// delay releasing inflight snapshot for another 30 seconds to
@@ -2143,11 +2151,13 @@ func (s *EtcdServer) sendMergedSnap(merged snap.Message) {
 			// to catch up. We cannot avoid the snapshot cycle anyway.
 			if ok {
 				select {
-				case <-time.After(releaseDelayAfterSnapshot):
+				case <-time.After(releaseDelayAfterSnapshot): // 默认阻塞等待30s
 				case <-s.stopping:
 				}
 			}
 
+			// snap-message消息发送完成或是超时之后，会递减该值，
+			// 该值递减到0时，对memory-storage的压缩才能执行
 			atomic.AddInt64(&s.inflightSnapshots, -1)
 
 			if lg != nil {
@@ -2215,34 +2225,36 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 	shouldApplyV3 := false
 	if e.Index > s.consistIndex.ConsistentIndex() {
 		// set the consistent index of current executing entry
-		s.consistIndex.setConsistentIndex(e.Index)
+		s.consistIndex.setConsistentIndex(e.Index) // 更新consist-index记录的索引值
 		shouldApplyV3 = true
 	}
 
 	// raft state machine may generate noop entry when leader confirmation.
 	// skip it in advance to avoid some potential bug in the future
-	if len(e.Data) == 0 {
+	if len(e.Data) == 0 { // 空的entry记录只会在leader选举结束时出现
 		select {
 		case s.forceVersionC <- struct{}{}:
 		default:
 		}
 		// promote lessor when the local member is leader and finished
 		// applying all entries from the last term.
-		if s.isLeader() {
+		if s.isLeader() { // 如果当前节点为leader，则晋升其lessor实例
 			s.lessor.Promote(s.Cfg.electionTimeout())
 		}
 		return
 	}
 
 	var raftReq pb.InternalRaftRequest
+	// 首先尝试将data反序列化为internal-raft-request实例，其中封装了所有类型的client请求
 	if !pbutil.MaybeUnmarshal(&raftReq, e.Data) { // backward compatible
 		var r pb.Request
 		rp := &r
+		// 兼容性处理，如果上述反序列化失败，则将data反序列化为pb-request实例
 		pbutil.MustUnmarshal(rp, e.Data)
 		s.w.Trigger(r.ID, s.applyV2Request((*RequestV2)(rp)))
 		return
 	}
-	if raftReq.V2 != nil {
+	if raftReq.V2 != nil { // 上述序列化成功，且是v2的请求，调用v2的方法处理
 		req := (*RequestV2)(raftReq.V2)
 		s.w.Trigger(req.ID, s.applyV2Request(req))
 		return
@@ -2253,26 +2265,30 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 		return
 	}
 
-	id := raftReq.ID
+	// 开始对v3版本请求的处理
+	id := raftReq.ID // 获取请求的id
 	if id == 0 {
 		id = raftReq.Header.ID
 	}
 
 	var ar *applyResult
-	needResult := s.w.IsRegistered(id)
+	needResult := s.w.IsRegistered(id) // 检测该请求是否需要响应
 	if needResult || !noSideEffect(&raftReq) {
 		if !needResult && raftReq.Txn != nil {
 			removeNeedlessRangeReqs(raftReq.Txn)
 		}
-		ar = s.applyV3.Apply(&raftReq)
+		ar = s.applyV3.Apply(&raftReq) // 调用v3-apply方法处理entry，其中会根据请求的类型选择不同的方法进行处理
 	}
 
 	if ar == nil {
 		return
 	}
-
+	// 返回结果为nil则直接返回；
+	// 如果返回了err-no-space错误，则表示底层的backend已经没有足够的空间，如果是第一次出现这种情况，
+	// 则在后边立即启动一个后台goroutine，并调用etcd-server-raft-request方法发送alarm-request请求，
+	// 其他节点收到该请求时，会停止后续的put操作；
 	if ar.err != ErrNoSpace || len(s.alarmStore.Get(pb.AlarmType_NOSPACE)) > 0 {
-		s.w.Trigger(id, ar)
+		s.w.Trigger(id, ar) // 将上述处理结果写入对应的通道中，然后将对应通道关闭
 		return
 	}
 
@@ -2287,14 +2303,14 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 		plog.Errorf("applying raft message exceeded backend quota")
 	}
 
-	s.goAttach(func() {
-		a := &pb.AlarmRequest{
+	s.goAttach(func() { // 第一次出现err-no-space错误
+		a := &pb.AlarmRequest{ // 新建alarm req
 			MemberID: uint64(s.ID()),
 			Action:   pb.AlarmRequest_ACTIVATE,
 			Alarm:    pb.AlarmType_NOSPACE,
 		}
-		s.raftRequest(s.ctx, pb.InternalRaftRequest{Alarm: a})
-		s.w.Trigger(id, ar)
+		s.raftRequest(s.ctx, pb.InternalRaftRequest{Alarm: a}) // 将alarm req封装成msg-prop消息，并发送到集群中
+		s.w.Trigger(id, ar) // 将上述处理结果写入对应的通道中，然后将对应通道关闭
 	})
 }
 
@@ -2308,8 +2324,10 @@ func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.Con
 	}
 
 	lg := s.getLogger()
+	// 将conf-change交给etcd-raft模块进行处理，其中会根据conf-change的类型进行分类处理，
+	// 这里返回的conf-state中记录了集群中最新的节点id
 	*confState = *s.r.ApplyConfChange(cc)
-	switch cc.Type {
+	switch cc.Type { // 根据请求的类型进行相应处理
 	case raftpb.ConfChangeAddNode, raftpb.ConfChangeAddLearnerNode:
 		confChangeContext := new(membership.ConfigChangeContext)
 		if err := json.Unmarshal(cc.Context, confChangeContext); err != nil {
@@ -2333,9 +2351,10 @@ func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.Con
 		if confChangeContext.IsPromote {
 			s.cluster.PromoteMember(confChangeContext.Member.ID)
 		} else {
-			s.cluster.AddMember(&confChangeContext.Member)
+			s.cluster.AddMember(&confChangeContext.Member) // 将新member实例添加到本地raft-cluster中
 
 			if confChangeContext.Member.ID != s.id {
+				// 如果添加的是远端节点，则需要在transport中添加对应的peer实例
 				s.r.transport.AddPeer(confChangeContext.Member.ID, confChangeContext.PeerURLs)
 			}
 		}
@@ -2351,15 +2370,15 @@ func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.Con
 
 	case raftpb.ConfChangeRemoveNode:
 		id := types.ID(cc.NodeID)
-		s.cluster.RemoveMember(id)
+		s.cluster.RemoveMember(id) // 从raft-cluster中删除指定的member实例
 		if id == s.id {
-			return true, nil
+			return true, nil // 如果移除的是当前节点则返回true
 		}
-		s.r.transport.RemovePeer(id)
+		s.r.transport.RemovePeer(id) // 如果移除远端节点，则需要从transport中删除对应的peer实例
 
 	case raftpb.ConfChangeUpdateNode:
 		m := new(membership.Member)
-		if err := json.Unmarshal(cc.Context, m); err != nil {
+		if err := json.Unmarshal(cc.Context, m); err != nil { // 将context中的数据反序列化成member实例
 			if lg != nil {
 				lg.Panic("failed to unmarshal member", zap.Error(err))
 			} else {
@@ -2377,8 +2396,9 @@ func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.Con
 				plog.Panicf("nodeID should always be equal to member ID")
 			}
 		}
+		// 更新本地raft-cluster实例中相应的member实例
 		s.cluster.UpdateRaftAttributes(m.ID, m.RaftAttributes)
-		if m.ID != s.id {
+		if m.ID != s.id { /// 如果是更新远端节点，则需要更新transport中对应的peer实例
 			s.r.transport.UpdatePeer(m.ID, m.PeerURLs)
 		}
 	}
@@ -2386,20 +2406,22 @@ func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.Con
 }
 
 // TODO: non-blocking snapshot
+// 生成快照文件的方法，其中会启动一个单独的后台goroutine来完成新快照文件的生成，
+// 主要是序列化v2存储中的数据并持久化到文件中，触发相应的压缩操作；
 func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState) {
-	clone := s.v2store.Clone()
+	clone := s.v2store.Clone() // 复制v2存储
 	// commit kv to write metadata (for example: consistent index) to disk.
 	// KV().commit() updates the consistent index in backend.
 	// All operations that update consistent index must be called sequentially
 	// from applyAll function.
 	// So KV().Commit() cannot run in parallel with apply. It has to be called outside
 	// the go routine created below.
-	s.KV().Commit()
+	s.KV().Commit() // 提交v3存储中当前等待读写的事务
 
 	s.goAttach(func() {
 		lg := s.getLogger()
 
-		d, err := clone.SaveNoCopy()
+		d, err := clone.SaveNoCopy() // 将v2存储序列化成json数据
 		// TODO: current store will never fail to do a snapshot
 		// what should we do if the store might fail?
 		if err != nil {
@@ -2409,6 +2431,8 @@ func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState) {
 				plog.Panicf("store save should never fail: %v", err)
 			}
 		}
+		// 将上述快照数据和元数据更新到etcd-raft模块中的memory-storage中，
+		// 并且返回snapshot实例
 		snap, err := s.r.raftStorage.CreateSnapshot(snapi, &confState, d)
 		if err != nil {
 			// the snapshot was done asynchronously with the progress of raft.
@@ -2423,6 +2447,7 @@ func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState) {
 			}
 		}
 		// SaveSnap saves the snapshot to file and appends the corresponding WAL entry.
+		// 将v2存储的快照数据记录到磁盘中，该过程涉及在wal日志文件中记录快照元数据及写入snap文件等操作
 		if err = s.r.storage.SaveSnap(snap); err != nil {
 			if lg != nil {
 				lg.Panic("failed to save snapshot", zap.Error(err))
@@ -2451,6 +2476,8 @@ func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState) {
 		// the snapshot sent to catch up. If we do not pause compaction, the log entries right after
 		// the snapshot sent might already be compacted. It happens when the snapshot takes long time
 		// to send and save. Pausing compaction avoids triggering a snapshot sending cycle.
+		// 如果当前还存在已发送但未响应的快照消息，则不能进行后续的压缩操作，
+		// 如果进行了后续的压缩，则可能导致follower节点再次无法赶上leader节点，从而需要再次发送快照数据
 		if atomic.LoadInt64(&s.inflightSnapshots) != 0 {
 			if lg != nil {
 				lg.Info("skip compaction since there is an inflight snapshot")
@@ -2461,12 +2488,13 @@ func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState) {
 		}
 
 		// keep some in memory log entries for slow followers.
+		// 为了防止集群中存在比较慢的follower节点，保留一些entry记录不压缩
 		compacti := uint64(1)
 		if snapi > s.Cfg.SnapshotCatchUpEntries {
 			compacti = snapi - s.Cfg.SnapshotCatchUpEntries
 		}
 
-		err = s.r.raftStorage.Compact(compacti)
+		err = s.r.raftStorage.Compact(compacti) // 压缩memory-storage中指定位置之前的全部entry记录
 		if err != nil {
 			// the compaction was done asynchronously with the progress of raft.
 			// raft log might already been compact.
