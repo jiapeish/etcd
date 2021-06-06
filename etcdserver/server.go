@@ -1083,7 +1083,7 @@ func (s *EtcdServer) run() {
 	for {
 		select {
 		case ap := <-s.r.apply(): // 读取raft-node apply chan 中的apply实例并进行处理
-			f := func(context.Context) { s.applyAll(&ep, &ap) }
+			f := func(context.Context) { s.applyAll(&ep, &ap) } // 调用apply all方法处理从中读取到的apply实例(封装了待应用的entry记录、待应用的快照数据和notify channel)
 			sched.Schedule(f)
 		case leases := <-expiredLeaseC:
 			s.goAttach(func() {
@@ -1137,7 +1137,7 @@ func (s *EtcdServer) run() {
 }
 
 func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply) {
-	s.applySnapshot(ep, apply)
+	s.applySnapshot(ep, apply) // 处理apply实例中的快照数据
 	s.applyEntries(ep, apply)
 
 	proposalsApplied.Set(float64(ep.appliedi))
@@ -1158,6 +1158,9 @@ func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply) {
 	}
 }
 
+// 先等待raft-node将快照数据持久化到磁盘中，
+// 之后根据快照元数据查找bolt db数据库文件并重建backend实例，
+// 最后根据重建后的存储更新本地raft cluster实例
 func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 	if raft.IsEmptySnap(apply.snapshot) {
 		return
@@ -1191,7 +1194,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		applySnapshotInProgress.Dec()
 	}()
 
-	if apply.snapshot.Metadata.Index <= ep.appliedi {
+	if apply.snapshot.Metadata.Index <= ep.appliedi { // 如果快照中最后一条entry的索引值<当前节点已应用entry的索引值，则异常结束
 		if lg != nil {
 			lg.Panic(
 				"unexpected leader snapshot from outdated index",
@@ -1207,8 +1210,10 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 	}
 
 	// wait for raftNode to persist snapshot onto the disk
+	// raft-node将快照数据写入磁盘文件之后，会向notify channel中写入一个空结构体作为信号，这里会阻塞等待该信号
 	<-apply.notifyc
 
+	// 根据快照信息查找对应的bolt db数据库文件，并创建新的backend实例
 	newbe, err := openSnapshotBackend(s.Cfg, s.snapshotter, apply.snapshot)
 	if err != nil {
 		if lg != nil {
@@ -1250,7 +1255,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		}
 	}
 
-	s.consistIndex.setConsistentIndex(s.kv.ConsistentIndex())
+	s.consistIndex.setConsistentIndex(s.kv.ConsistentIndex()) // 重置etcd-server consist-index字段
 	if lg != nil {
 		lg.Info("restored mvcc store")
 	} else {
@@ -1275,6 +1280,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 				plog.Info("finished closing old backend")
 			}
 		}()
+		// 因为此时可能还有事务在执行，关闭旧backend实例可能会被阻塞，所以这里启动一个后台goroutine用来关闭backend实例
 		if err := oldbe.Close(); err != nil {
 			if lg != nil {
 				lg.Panic("failed to close old backend", zap.Error(err))
@@ -1284,7 +1290,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		}
 	}()
 
-	s.be = newbe
+	s.be = newbe // 更新etcd-server实例中使用的backend实例
 	s.bemu.Unlock()
 
 	if lg != nil {
@@ -1293,6 +1299,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		plog.Info("recovering alarms...")
 	}
 
+	// 恢复etcd-server中的alarm-store和auth-store，它们分别对应bolt db中的alarm bucket和auth bucket
 	if err := s.restoreAlarms(); err != nil {
 		if lg != nil {
 			lg.Panic("failed to restore alarm store", zap.Error(err))
@@ -1342,7 +1349,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		plog.Info("finished recovering store v2")
 	}
 
-	s.cluster.SetBackend(newbe)
+	s.cluster.SetBackend(newbe) // 设置raft-cluster backend实例
 
 	if lg != nil {
 		lg.Info("restoring cluster configuration")
@@ -1350,7 +1357,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		plog.Info("recovering cluster configuration...")
 	}
 
-	s.cluster.Recover(api.UpdateCapability)
+	s.cluster.Recover(api.UpdateCapability) // 恢复本地的集群信息
 
 	if lg != nil {
 		lg.Info("restored cluster configuration")
@@ -1361,6 +1368,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 	}
 
 	// recover raft transport
+	// 清空transport中所有的peer实例，并根据恢复后的raft-cluster实例重新添加
 	s.r.transport.RemoveAllPeers()
 
 	if lg != nil {
@@ -1384,18 +1392,20 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		plog.Info("finished adding peers from new cluster configuration into network...")
 	}
 
+	// 更新etcd progress，其中包括已应用entry记录的term值、index值和快照相关信息
 	ep.appliedt = apply.snapshot.Metadata.Term
 	ep.appliedi = apply.snapshot.Metadata.Index
 	ep.snapi = ep.appliedi
 	ep.confState = apply.snapshot.Metadata.ConfState
 }
 
+// 应用完快照数据之后，etcd-server run goroutine紧接着会调用该方法处理待应用的entry记录
 func (s *EtcdServer) applyEntries(ep *etcdProgress, apply *apply) {
-	if len(apply.entries) == 0 {
+	if len(apply.entries) == 0 { // 检测是否存在待应用的entry记录，如果为空则直接返回
 		return
 	}
 	firsti := apply.entries[0].Index
-	if firsti > ep.appliedi+1 {
+	if firsti > ep.appliedi+1 { // 检测待应用的第一条entry记录是否合法
 		if lg := s.getLogger(); lg != nil {
 			lg.Panic(
 				"unexpected committed entry index",
@@ -1408,13 +1418,13 @@ func (s *EtcdServer) applyEntries(ep *etcdProgress, apply *apply) {
 	}
 	var ents []raftpb.Entry
 	if ep.appliedi+1-firsti < uint64(len(apply.entries)) {
-		ents = apply.entries[ep.appliedi+1-firsti:]
+		ents = apply.entries[ep.appliedi+1-firsti:] // 忽略已应用的entry记录，只保留未应用的entry记录
 	}
 	if len(ents) == 0 {
 		return
 	}
 	var shouldstop bool
-	if ep.appliedt, ep.appliedi, shouldstop = s.apply(ents, &ep.confState); shouldstop {
+	if ep.appliedt, ep.appliedi, shouldstop = s.apply(ents, &ep.confState); shouldstop { // 调用apply方法应用ents中的entry记录
 		go s.stopWithDelay(10*100*time.Millisecond, fmt.Errorf("the member has been permanently removed from the cluster"))
 	}
 }
@@ -2156,13 +2166,14 @@ func (s *EtcdServer) sendMergedSnap(merged snap.Message) {
 // apply takes entries received from Raft (after it has been committed) and
 // applies them to the current state of the EtcdServer.
 // The given entries should not be empty.
+// 该方法完成entry记录的应用，其中会遍历ents中的全部entry记录，并根据entry的类型进行不同的处理
 func (s *EtcdServer) apply(
 	es []raftpb.Entry,
 	confState *raftpb.ConfState,
 ) (appliedt uint64, appliedi uint64, shouldStop bool) {
-	for i := range es {
+	for i := range es { // 遍历待应用的entry记录
 		e := es[i]
-		switch e.Type {
+		switch e.Type { // 根据entry记录的不同类型，进行不同的处理
 		case raftpb.EntryNormal:
 			s.applyEntryNormal(&e)
 			s.setAppliedIndex(e.Index)
@@ -2170,15 +2181,18 @@ func (s *EtcdServer) apply(
 
 		case raftpb.EntryConfChange:
 			// set the consistent index of current executing entry
+			// 更新consist index，其中保存了当前节点应用的最后一条entry记录的索引值
 			if e.Index > s.consistIndex.ConsistentIndex() {
 				s.consistIndex.setConsistentIndex(e.Index)
 			}
 			var cc raftpb.ConfChange
-			pbutil.MustUnmarshal(&cc, e.Data)
-			removedSelf, err := s.applyConfChange(cc, confState)
-			s.setAppliedIndex(e.Index)
-			s.setTerm(e.Term)
+			pbutil.MustUnmarshal(&cc, e.Data) // 将entry-data反序列化成conf change实例
+			removedSelf, err := s.applyConfChange(cc, confState) // 处理conf state，当返回值为true时，表示将当前节点从集群中移除
+			s.setAppliedIndex(e.Index) // 更新raft-node的index
+			s.setTerm(e.Term) // 更新raft-node的term
 			shouldStop = shouldStop || removedSelf
+			// add-member, update-member, remove-member等方法会阻塞监听conf-change对应的通道，
+			// 这里在对应的entry处理完成之后，会关闭对应的通道，通知监听的goroutine
 			s.w.Trigger(cc.ID, &confChangeResponse{s.cluster.Members(), err})
 
 		default:
@@ -2191,9 +2205,9 @@ func (s *EtcdServer) apply(
 				plog.Panicf("entry type should be either EntryNormal or EntryConfChange")
 			}
 		}
-		appliedi, appliedt = e.Index, e.Term
+		appliedi, appliedt = e.Index, e.Term // 更新返回值
 	}
-	return appliedt, appliedi, shouldStop
+	return appliedt, appliedi, shouldStop // 最后一个返回值表示当前节点是否已从集群中移除
 }
 
 // applyEntryNormal apples an EntryNormal type raftpb request to the EtcdServer

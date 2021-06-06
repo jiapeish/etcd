@@ -669,22 +669,29 @@ func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.In
 // Watchable returns a watchable interface attached to the etcdserver.
 func (s *EtcdServer) Watchable() mvcc.WatchableKV { return s.KV() }
 
+// 该方法首先阻塞等待readwait c通道上的信号，然后记录当前的read notifier字段并进行更新，
+// 在linearizable read notify方法中会监听该notifier实例中封装的通道（c字段），
+// 之后发送Msg readindex消息，并交由etcd-raft模块进行处理；
+// 在raft-node对ready实例处理时，raft-node会将其中记录的read-state写入read-state-c通道中，
+// 该readloop方法最后会监听read-state-c通道，等待之前的Msg readindex消息处理结束；
 func (s *EtcdServer) linearizableReadLoop() {
 	var rs raft.ReadState
 
 	for {
 		ctxToSend := make([]byte, 8)
 		id1 := s.reqIDGen.Next()
-		binary.BigEndian.PutUint64(ctxToSend, id1)
+		binary.BigEndian.PutUint64(ctxToSend, id1) // 创建唯一id
 		leaderChangedNotifier := s.leaderChangedNotify()
 		select {
 		case <-leaderChangedNotifier:
 			continue
+		// 在client发起一次linearizable read时，会向该readwait c通道中写入一个空结构体作为信号
 		case <-s.readwaitc:
-		case <-s.stopping:
+		case <-s.stopping: // 监听到关闭，则表示当前etcd server实例正在关闭，会结束该goroutine
 			return
 		}
 
+		// 新建notifier实例，然后记录当前的notifier实例，并更新etcdserver read notifier字段
 		nextnr := newNotifier()
 
 		s.readMu.Lock()
@@ -694,7 +701,7 @@ func (s *EtcdServer) linearizableReadLoop() {
 
 		lg := s.getLogger()
 		cctx, cancel := context.WithTimeout(context.Background(), s.Cfg.ReqTimeout())
-		if err := s.r.ReadIndex(cctx, ctxToSend); err != nil {
+		if err := s.r.ReadIndex(cctx, ctxToSend); err != nil { // 创建并处理msg readindex请求
 			cancel()
 			if err == raft.ErrStopped {
 				return
@@ -714,11 +721,11 @@ func (s *EtcdServer) linearizableReadLoop() {
 			timeout bool
 			done    bool
 		)
-		for !timeout && !done {
+		for !timeout && !done { // 检测msg readindex请求是否超时，是否已被处理完
 			select {
-			case rs = <-s.r.readStateC:
-				done = bytes.Equal(rs.RequestCtx, ctxToSend)
-				if !done {
+			case rs = <-s.r.readStateC: // 在raft-node处理ready实例时，会将ready-readstate中最后一项写入该通道中
+				done = bytes.Equal(rs.RequestCtx, ctxToSend) // 在request-ctx中携带了请求id
+				if !done { // 忽略乱序的响应，输出日志并继续当前for循环等待请求对应的响应
 					// a previous request might time out. now we should ignore the response of it and
 					// continue waiting for the response of the current requests.
 					id2 := uint64(0)
@@ -747,7 +754,7 @@ func (s *EtcdServer) linearizableReadLoop() {
 				} else {
 					plog.Warningf("timed out waiting for read index response (local node might have slow network)")
 				}
-				nr.notify(ErrTimeout)
+				nr.notify(ErrTimeout) // 在notifier err字段中设置错误信息，同时关闭notifier ctongd
 				timeout = true
 				slowReadIndex.Inc()
 			case <-s.stopping:
@@ -758,31 +765,37 @@ func (s *EtcdServer) linearizableReadLoop() {
 			continue
 		}
 
-		if ai := s.getAppliedIndex(); ai < rs.Index {
+		if ai := s.getAppliedIndex(); ai < rs.Index { // readstate index记录的是committed index
 			select {
+			// 如果当前节点已应用的entry记录未到指定的committed index，则需要阻塞等待；
+			// 在etcdserver apply-all方法处理完待应用entry记录后，会将已应用entry记录在wait-time中的通道关闭，
+			// 此处可以得到该信号，继续执行
 			case <-s.applyWait.Wait(rs.Index):
 			case <-s.stopping:
 				return
 			}
 		}
 		// unblock all l-reads requested at indices before rs.Index
-		nr.notify(nil)
+		nr.notify(nil) // 关闭notifier c通道
 	}
 }
 
 func (s *EtcdServer) linearizableReadNotify(ctx context.Context) error {
 	s.readMu.RLock()
-	nc := s.readNotifier
+	nc := s.readNotifier // 获取 read-notifier实例
 	s.readMu.RUnlock()
 
 	// signal linearizable loop for current notify if it hasn't been already
 	select {
+	// 在linearizable readloop goroutine中会阻塞监听该channel，这里会向该channel写入一个空结构体作为信号，通知readloop开始工作
 	case s.readwaitc <- struct{}{}:
 	default:
 	}
 
 	// wait for read state notification
 	select {
+	// 在linearizable readloop goroutine发现已应用entry的索引值超过了请求时的committed index，则关闭notifier c通道，
+	// 通知执行读取操作的该goroutine继续后续读取操作
 	case <-nc.c:
 		return nc.err
 	case <-ctx.Done():
