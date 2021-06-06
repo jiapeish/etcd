@@ -183,6 +183,29 @@ type Server interface {
 	Alarms() []*pb.AlarmMember
 }
 
+//
+// ┌───────────────────┐               ┌────────────────────┐
+// │                   │               │                    │
+// │    applyV3        │               │  authApplierV3     │
+// │                   ├───────────────►                    │
+// │                   │               │  ┌──────────────┐  │
+// └───────────────────┘               │  │              │  │
+//                                     │  │quotaApplierV3│  │
+//                                     │  │              │  │
+//                                     │  └──────────────┘  │
+//                                     │                    │
+//                                     └────────────────────┘
+//
+//
+// ┌───────────────────┐
+// │                   │               ┌────────────────────┐
+// │  applyV3Base      │               │                    │
+// │                   ├───────────────►  applierV3Backend  │
+// │                   │               │                    │
+// └───────────────────┘               └────────────────────┘
+//
+//
+
 // EtcdServer is the production implementation of the Server interface
 type EtcdServer struct {
 	// inflightSnapshots holds count the number of snapshots currently inflight.

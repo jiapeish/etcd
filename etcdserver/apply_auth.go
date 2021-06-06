@@ -25,22 +25,27 @@ import (
 	"go.etcd.io/etcd/pkg/traceutil"
 )
 
+// 在applier-v3-backend的基础上扩展了权限控制
 type authApplierV3 struct {
 	applierV3
-	as     auth.AuthStore
+	as     auth.AuthStore // 定义与权限管理相关的操作
 	lessor lease.Lessor
 
 	// mu serializes Apply so that user isn't corrupted and so that
 	// serialized requests don't leak data from TOCTOU errors
 	mu sync.Mutex
 
-	authInfo auth.AuthInfo
+	authInfo auth.AuthInfo // 处理每个请求时，都会使用该字段记录请求头中的权限信息
 }
 
 func newAuthApplierV3(as auth.AuthStore, base applierV3, lessor lease.Lessor) *authApplierV3 {
 	return &authApplierV3{applierV3: base, as: as, lessor: lessor}
 }
 
+// 重写了apply方法：
+// 首先记录请求头中携带的权限信息，
+// 然后对此次请求是否需要admin权限进行检测，
+// 最后调用底层applier-v3实现的apply方法完成请求的分发；
 func (aa *authApplierV3) Apply(r *pb.InternalRaftRequest) *applyResult {
 	aa.mu.Lock()
 	defer aa.mu.Unlock()
@@ -50,21 +55,24 @@ func (aa *authApplierV3) Apply(r *pb.InternalRaftRequest) *applyResult {
 		aa.authInfo.Username = r.Header.Username
 		aa.authInfo.Revision = r.Header.AuthRevision
 	}
+	// 检测该请求是否需要admin权限：
+	// 其中auth-enable, auth-disable, auth-user, auth-role等请求都是需要admin权限的
 	if needAdminPermission(r) {
-		if err := aa.as.IsAdminPermitted(&aa.authInfo); err != nil {
+		if err := aa.as.IsAdminPermitted(&aa.authInfo); err != nil { // 检测admin权限
 			aa.authInfo.Username = ""
 			aa.authInfo.Revision = 0
 			return &applyResult{err: err}
 		}
 	}
-	ret := aa.applierV3.Apply(r)
-	aa.authInfo.Username = ""
+	ret := aa.applierV3.Apply(r) // 调用底层applier-v3实现的apply方法完成请求分发
+	aa.authInfo.Username = "" // 清空auth-applier-v3 auth-info
 	aa.authInfo.Revision = 0
 	return ret
 }
 
+// 重写了put方法，添加了权限检查的相关逻辑
 func (aa *authApplierV3) Put(txn mvcc.TxnWrite, r *pb.PutRequest) (*pb.PutResponse, *traceutil.Trace, error) {
-	if err := aa.as.IsPutPermitted(&aa.authInfo, r.Key); err != nil {
+	if err := aa.as.IsPutPermitted(&aa.authInfo, r.Key); err != nil { // 检测put权限
 		return nil, nil, err
 	}
 
@@ -76,7 +84,7 @@ func (aa *authApplierV3) Put(txn mvcc.TxnWrite, r *pb.PutRequest) (*pb.PutRespon
 		return nil, nil, err
 	}
 
-	if r.PrevKv {
+	if r.PrevKv { // 如果需要返回更新前的键值对信息，则需要用range权限
 		err := aa.as.IsRangePermitted(&aa.authInfo, r.Key, nil)
 		if err != nil {
 			return nil, nil, err

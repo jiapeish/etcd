@@ -49,8 +49,10 @@ type applyResult struct {
 
 // applierV3 is the interface for processing V3 raft messages
 type applierV3 interface {
+	// 在apply-entry-normal方法可以看到，其中会根据internal-raft-request的类型调用不同的方法进行处理
 	Apply(r *pb.InternalRaftRequest) *applyResult
 
+	// 分别对应于v3存储中的同名方法
 	Put(txn mvcc.TxnWrite, p *pb.PutRequest) (*pb.PutResponse, *traceutil.Trace, error)
 	Range(ctx context.Context, txn mvcc.TxnRead, r *pb.RangeRequest) (*pb.RangeResponse, error)
 	DeleteRange(txn mvcc.TxnWrite, dr *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error)
@@ -86,6 +88,7 @@ type applierV3 interface {
 
 type checkReqFunc func(mvcc.ReadView, *pb.RequestOp) error
 
+// 是applier-v3接口的核心实现
 type applierV3backend struct {
 	s *EtcdServer
 
@@ -122,6 +125,8 @@ func (a *applierV3backend) Apply(r *pb.InternalRaftRequest) *applyResult {
 	}(time.Now())
 
 	// call into a.s.applyV3.F instead of a.F so upper appliers can check individual calls
+	// 这里调用的是etcd-server-apply-v3对应的方法，而不是直接调用applier-v3-backend实例对应的方法，
+	// 在etcd-server中，apply-v3-base字段指向了applier-v3-backend实例，而apply-v3字段则是在apply-v3-base基础上的扩展
 	switch {
 	case r.Range != nil:
 		ar.resp, ar.err = a.s.applyV3.Range(context.TODO(), nil, r.Range)
@@ -188,14 +193,15 @@ func (a *applierV3backend) Put(txn mvcc.TxnWrite, p *pb.PutRequest) (resp *pb.Pu
 		traceutil.Field{Key: "req_size", Value: proto.Size(p)},
 	)
 	val, leaseID := p.Value, lease.LeaseID(p.Lease)
-	if txn == nil {
+	if txn == nil { // 如果传入的txn事务为空，则开启新事务
 		if leaseID != lease.NoLease {
+			// 查找put-request携带的lease-id是否存在，不存在则返回错误
 			if l := a.s.lessor.Lookup(leaseID); l == nil {
 				return nil, nil, lease.ErrLeaseNotFound
 			}
 		}
 		txn = a.s.KV().Write(trace)
-		defer txn.End()
+		defer txn.End() // 方法结束时关闭该方法中开启的事务
 	}
 
 	var rr *mvcc.RangeResult
@@ -241,7 +247,7 @@ func (a *applierV3backend) DeleteRange(txn mvcc.TxnWrite, dr *pb.DeleteRangeRequ
 		defer txn.End()
 	}
 
-	if dr.PrevKv {
+	if dr.PrevKv { // 如果prev-kv为true，则先查询指定范围的键值对，并封装到返回值中
 		rr, err := txn.Range(dr.Key, end, mvcc.RangeOptions{})
 		if err != nil {
 			return nil, err
@@ -264,7 +270,7 @@ func (a *applierV3backend) Range(ctx context.Context, txn mvcc.TxnRead, r *pb.Ra
 	resp := &pb.RangeResponse{}
 	resp.Header = &pb.ResponseHeader{}
 
-	if txn == nil {
+	if txn == nil { // 如果当前只读事务为空，则开启新的只读事务，并在range查询结束后关闭此事务
 		txn = a.s.kv.Read(trace)
 		defer txn.End()
 	}
@@ -274,11 +280,11 @@ func (a *applierV3backend) Range(ctx context.Context, txn mvcc.TxnRead, r *pb.Ra
 		r.MinModRevision != 0 || r.MaxModRevision != 0 ||
 		r.MinCreateRevision != 0 || r.MaxCreateRevision != 0 {
 		// fetch everything; sort and truncate afterwards
-		limit = 0
+		limit = 0 // 如果指定了上述查询条件，则先查询全部符合条件的kv，然后进行limit的过滤
 	}
 	if limit > 0 {
 		// fetch one extra for 'more' flag
-		limit = limit + 1
+		limit = limit + 1 // 修正
 	}
 
 	ro := mvcc.RangeOptions{
@@ -358,6 +364,8 @@ func (a *applierV3backend) Range(ctx context.Context, txn mvcc.TxnRead, r *pb.Ra
 
 func (a *applierV3backend) Txn(rt *pb.TxnRequest) (*pb.TxnResponse, error) {
 	isWrite := !isTxnReadonly(rt)
+	// 开启只读事务，该函数返回一个txn-read-write实例，
+	// 该实例虽然实现了txn-write接口，但是其底层依赖只读事务完成读操作，其写操作（put, delete-range等）都是不可用的
 	txn := mvcc.NewReadOnlyTxnWrite(a.s.KV().Read(traceutil.TODO()))
 
 	txnPath := compareToPath(txn, rt)
@@ -378,18 +386,18 @@ func (a *applierV3backend) Txn(rt *pb.TxnRequest) (*pb.TxnResponse, error) {
 	// readers do not see any intermediate results. Since writes are
 	// serialized on the raft loop, the revision in the read view will
 	// be the revision of the write txn.
-	if isWrite {
+	if isWrite { // 如果txn-request中包含写操作，则结束当前只读事务，开启读写事务
 		txn.End()
 		txn = a.s.KV().Write(traceutil.TODO())
 	}
 	a.applyTxn(txn, rt, txnPath, txnResp)
-	rev := txn.Rev()
+	rev := txn.Rev() // 获取当前的rev
 	if len(txn.Changes()) != 0 {
-		rev++
+		rev++ // 如果此次事务中有更新操作，则递增rev
 	}
-	txn.End()
+	txn.End() // 提交事务
 
-	txnResp.Header.Revision = rev
+	txnResp.Header.Revision = rev // 记录最新的rev
 	return txnResp, nil
 }
 
@@ -581,11 +589,12 @@ func (a *applierV3backend) Compaction(compaction *pb.CompactionRequest) (*pb.Com
 		traceutil.Field{Key: "revision", Value: compaction.Revision},
 	)
 
-	ch, err := a.s.KV().Compact(trace, compaction.Revision)
+	ch, err := a.s.KV().Compact(trace, compaction.Revision) // 完成压缩操作
 	if err != nil {
 		return nil, ch, nil, err
 	}
 	// get the current revision. which key to get is not important.
+	// 主要是为了获取最新的revision
 	rr, _ := a.s.KV().Range([]byte("compaction"), nil, mvcc.RangeOptions{})
 	resp.Header.Revision = rr.Rev
 	return resp, ch, trace, err
@@ -617,6 +626,8 @@ func (a *applierV3backend) LeaseCheckpoint(lc *pb.LeaseCheckpointRequest) (*pb.L
 	return &pb.LeaseCheckpointResponse{Header: newHeader(a.s)}, nil
 }
 
+// 当首次触发限流时会创建alarm-request请求并封装成msg-prop消息发送到集群中，
+// 当alarm-request请求经过raft协议提交之后，会调用该方法应用相应的entry记录，其会根据action字段进行分类处理
 func (a *applierV3backend) Alarm(ar *pb.AlarmRequest) (*pb.AlarmResponse, error) {
 	resp := &pb.AlarmResponse{}
 	oldCount := len(a.s.alarmStore.Get(ar.Alarm))
@@ -686,6 +697,9 @@ func (a *applierV3backend) Alarm(ar *pb.AlarmRequest) (*pb.AlarmResponse, error)
 	return resp, nil
 }
 
+// 在quota-applier-v3触发限流操作之后，就会创建该capped实例替换etcd-server当前使用的applier-v3接口实现；
+// 通过该实例执行任何写入操作（如put）都会失败，从而保证底层存储中的数据量不增加；
+// 其所有写操作都会返回err-no-space错误，从而保证底层bolt-db库中的数据量不再增加；
 type applierV3Capped struct {
 	applierV3
 	q backendQuota
@@ -836,9 +850,10 @@ func (a *applierV3backend) RoleList(r *pb.AuthRoleListRequest) (*pb.AuthRoleList
 	return resp, err
 }
 
+// 在applier-v3-backend的基础上提供了限流功能，即底层的bolt-db数据库文件的大小增大到上限之后，就会触发限流操作
 type quotaApplierV3 struct {
 	applierV3
-	q Quota
+	q Quota // 实现限流功能的核心
 }
 
 func newQuotaApplierV3(s *EtcdServer, app applierV3) applierV3 {
@@ -846,9 +861,13 @@ func newQuotaApplierV3(s *EtcdServer, app applierV3) applierV3 {
 }
 
 func (a *quotaApplierV3) Put(txn mvcc.TxnWrite, p *pb.PutRequest) (*pb.PutResponse, *traceutil.Trace, error) {
-	ok := a.q.Available(p)
-	resp, trace, err := a.applierV3.Put(txn, p)
+	ok := a.q.Available(p) // 检测是否触发限流
+	resp, trace, err := a.applierV3.Put(txn, p) // 委托给底层的applier-v3实现完成真正的put操作
 	if err == nil && !ok {
+		// 触发限流之后会返回该错误，
+		// 在apply-entry-normal方法中，当收到applier-v3-apply方法返回的err-no-space错误后，
+		// 会向集群其他节点发送alarm-request请求，当该请求经过raft协议提交之后，集群中各个节点在应用该请求时，
+		// 就会新建一个applier-v3-capped实例，并将当前etcd-server-apply-v3字段指向该实例；
 		err = ErrNoSpace
 	}
 	return resp, trace, err

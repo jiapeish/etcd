@@ -37,19 +37,25 @@ const (
 // too few resources available within the quota to apply the request.
 type Quota interface {
 	// Available judges whether the given request fits within the quota.
+	// 检测此次请求是否能通过限流，即当前请求执行后，未达到系统负载的上限，也就未触发限流
 	Available(req interface{}) bool
 	// Cost computes the charge against the quota for a given request.
+	// 计算此次请求所产生的负载，该方法主要在available方法中调用
 	Cost(req interface{}) int
 	// Remaining is the amount of charge left for the quota.
+	// 当前系统所能支持的剩余负载量
 	Remaining() int64
 }
 
+// 是quota接口的实现之一，但并没有实现限流的功能，其方法的返回值都是写死的
 type passthroughQuota struct{}
 
 func (*passthroughQuota) Available(interface{}) bool { return true }
 func (*passthroughQuota) Cost(interface{}) int       { return 0 }
 func (*passthroughQuota) Remaining() int64           { return 1 }
 
+// 是quota接口的实现之一，主要用于限制底层bolt-db中的数据量，
+// 其中封装了当前节点的etcd-server实例和bolt-db数据量的上限值
 type backendQuota struct {
 	s               *EtcdServer
 	maxBackendBytes int64
@@ -136,9 +142,11 @@ func NewBackendQuota(s *EtcdServer, name string) Quota {
 
 func (b *backendQuota) Available(v interface{}) bool {
 	// TODO: maybe optimize backend.Size()
+	// 将当前bolt-db中的数据量、此次请求的数据量之和与上限阈值进行比较，从而决定此次请求是否触发限流
 	return b.s.Backend().Size()+int64(b.Cost(v)) < b.maxBackendBytes
 }
 
+// 该方法得到请求的数据量，且会根据请求的类型进行分类计算
 func (b *backendQuota) Cost(v interface{}) int {
 	switch r := v.(type) {
 	case *pb.PutRequest:
@@ -152,6 +160,7 @@ func (b *backendQuota) Cost(v interface{}) int {
 	}
 }
 
+// 会计算请求的key值、value值和相关元数据的字节数之和
 func costPut(r *pb.PutRequest) int { return kvOverhead + len(r.Key) + len(r.Value) }
 
 func costTxnReq(u *pb.RequestOp) int {
