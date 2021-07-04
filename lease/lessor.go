@@ -19,6 +19,8 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"github.com/coreos/pkg/capnslog"
 	"math"
 	"sort"
 	"sync"
@@ -60,6 +62,8 @@ var (
 	ErrLeaseNotFound    = errors.New("lease not found")
 	ErrLeaseExists      = errors.New("lease already exists")
 	ErrLeaseTTLTooLarge = errors.New("too large lease TTL")
+
+	plog = capnslog.NewPackageLogger("go.etcd.io/etcd", "lessor")
 )
 
 // TxnDelete is a TxnWrite that only permits deletes. Defined here
@@ -299,6 +303,7 @@ func (le *lessor) Grant(id LeaseID, ttl int64) (*Lease, error) {
 	if le.isPrimary() {
 		item := &LeaseWithTime{id: l.ID, time: l.expiry.UnixNano()}
 		le.leaseExpiredNotifier.RegisterOrUpdate(item)
+		plog.Warningf("==== Grant lease id %d, current lessor is Primary, schedule checkpoint", id)
 		le.scheduleCheckpointIfNeeded(l)
 	}
 
@@ -451,6 +456,14 @@ func (le *lessor) Promote(extend time.Duration) {
 
 	if len(le.leaseMap) < leaseRevokeRate {
 		// no possibility of lease pile-up
+		if le.lg != nil {
+			le.lg.Warn("=== lessor promote",
+				zap.Int("lease map len", len(le.leaseMap)),
+				zap.Int("rate", leaseRevokeRate),
+			)
+		} else {
+			plog.Warningf("==== lessor promote, lease map len %d, rate %d.", len(le.leaseMap), leaseRevokeRate)
+		}
 		return
 	}
 
@@ -501,6 +514,7 @@ func (le *lessor) Demote() {
 
 	// set the expiries of all leases to forever
 	for _, l := range le.leaseMap {
+		plog.Warningf("==== lessor demote, set all leases to forever")
 		l.forever()
 	}
 
@@ -632,11 +646,13 @@ func (le *lessor) checkpointScheduledLeases() {
 	for i := 0; i < leaseCheckpointRate/2; i++ {
 		le.mu.Lock()
 		if le.isPrimary() {
+			plog.Warningf("==== lessor is primary, find checkpoints")
 			cps = le.findDueScheduledCheckpoints(maxLeaseCheckpointBatchSize)
 		}
 		le.mu.Unlock()
 
 		if len(cps) != 0 {
+			plog.Warningf("==== checkpoints found, invoke checkpointer")
 			le.cp(context.Background(), &pb.LeaseCheckpointRequest{Checkpoints: cps})
 		}
 		if len(cps) < maxLeaseCheckpointBatchSize {
@@ -724,6 +740,7 @@ func (le *lessor) scheduleCheckpointIfNeeded(lease *Lease) {
 				zap.Duration("intervalSeconds", le.checkpointInterval),
 			)
 		}
+		plog.Warningf("==== Scheduling lease checkpoint, leaseID %d, intervalSeconds %s", int64(lease.ID), le.checkpointInterval)
 		heap.Push(&le.leaseCheckpointHeap, &LeaseWithTime{
 			id:   lease.ID,
 			time: time.Now().Add(le.checkpointInterval).UnixNano(),
@@ -762,6 +779,7 @@ func (le *lessor) findDueScheduledCheckpoints(checkpointLimit int) []*pb.LeaseCh
 				zap.Int64("remainingTTL", remainingTTL),
 			)
 		}
+		plog.Warningf("==== Checkpointing lease, leaseID %d, remainingTTL %d", int64(lt.id), remainingTTL)
 		cps = append(cps, &pb.LeaseCheckpoint{ID: int64(lt.id), Remaining_TTL: remainingTTL})
 	}
 	return cps
@@ -851,6 +869,7 @@ func (l *Lease) RemainingTTL() int64 {
 
 // refresh refreshes the expiry of the lease.
 func (l *Lease) refresh(extend time.Duration) {
+	fmt.Printf("===== lease %d, Remaining ttl %d, remaining ttl %d, ttl %d\n", l.ID, l.RemainingTTL(), l.remainingTTL, l.ttl)
 	newExpiry := time.Now().Add(extend + time.Duration(l.RemainingTTL())*time.Second)
 	l.expiryMu.Lock()
 	defer l.expiryMu.Unlock()

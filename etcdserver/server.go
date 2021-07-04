@@ -646,6 +646,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 	if srv.Cfg.EnableLeaseCheckpoint {
 		// setting checkpointer enables lease checkpoint feature.
 		srv.lessor.SetCheckpointer(func(ctx context.Context, cp *pb.LeaseCheckpointRequest) {
+			plog.Warningf("==== checkpointer, send raft request once")
 			srv.raftRequestOnce(ctx, pb.InternalRaftRequest{LeaseCheckpoint: cp})
 		})
 	}
@@ -2263,6 +2264,11 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 		// applying all entries from the last term.
 		if s.isLeader() { // 如果当前节点为leader，则晋升其lessor实例
 			s.lessor.Promote(s.Cfg.electionTimeout())
+			if lg := s.getLogger(); lg != nil {
+				lg.Warn("=== current node becomes leader, promote lessor")
+			} else {
+				plog.Warningf("==== current node becomes leader, promote lessor")
+			}
 		}
 		return
 	}
