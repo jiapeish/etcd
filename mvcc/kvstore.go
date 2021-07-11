@@ -89,10 +89,10 @@ type store struct {
 
 	ig ConsistentIndexGetter
 
-	b       backend.Backend
-	kvindex index
+	b       backend.Backend // 当前store实例关联的后端存储
+	kvindex index // 当前store实例关联的内存索引
 
-	le lease.Lessor
+	le lease.Lessor // 租约相关
 
 	// revMuLock protects currentRev and compactMainRev.
 	// Locked at end of write txn and released after write txn unlock lock.
@@ -101,13 +101,13 @@ type store struct {
 	// currentRev is the revision of the last completed transaction.
 	currentRev int64
 	// compactMainRev is the main revision of the last compaction.
-	compactMainRev int64
+	compactMainRev int64 // 记录最近一次压缩后最小的revision信息（main revision部分的值）
 
 	// bytesBuf8 is a byte slice of length 8
 	// to avoid a repetitive allocation in saveIndex.
-	bytesBuf8 []byte
+	bytesBuf8 []byte // 索引缓冲区，主要用于记录consistent-index
 
-	fifoSched schedule.Scheduler
+	fifoSched schedule.Scheduler // fifo调度器
 
 	stopc chan struct{}
 
@@ -144,6 +144,7 @@ func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ig ConsistentI
 		s.le.SetRangeDeleter(func() lease.TxnDelete { return s.Write(traceutil.TODO()) })
 	}
 
+	// 获取backend的读写事务，创建名为"key"和"meta"的两个bucket，然后提交事务
 	tx := s.b.BatchTx()
 	tx.Lock()
 	tx.UnsafeCreateBucket(keyBucketName)
@@ -153,7 +154,7 @@ func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ig ConsistentI
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.restore(); err != nil {
+	if err := s.restore(); err != nil { // 从backend中恢复当前store的所有状态，其中包括内存中的btree索引等
 		// TODO: return the error instead of panic here?
 		panic("failed to recover store from backend")
 	}
@@ -549,10 +550,10 @@ func (s *store) saveIndex(tx backend.BatchTx) {
 	}
 	bs := s.bytesBuf8
 	ci := s.ig.ConsistentIndex()
-	binary.BigEndian.PutUint64(bs, ci)
+	binary.BigEndian.PutUint64(bs, ci) // 将consistent-index值写入缓冲区
 	// put the index into the underlying backend
 	// tx has been locked in TxnBegin, so there is no need to lock it again
-	tx.UnsafePut(metaBucketName, consistentIndexKeyName, bs)
+	tx.UnsafePut(metaBucketName, consistentIndexKeyName, bs) // 将consistent-index值记录到meta bucket中
 	atomic.StoreUint64(&s.consistentIndex, ci)
 }
 

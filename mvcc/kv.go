@@ -22,15 +22,15 @@ import (
 )
 
 type RangeOptions struct {
-	Limit int64
-	Rev   int64
-	Count bool
+	Limit int64 // 此次查询返回的键值对个数上限
+	Rev   int64 // 扫描内存索引时用到的main revision值
+	Count bool // 为真时，只返回键值对个数，不返回具体键值对数据
 }
 
 type RangeResult struct {
-	KVs   []mvccpb.KeyValue
+	KVs   []mvccpb.KeyValue // 此次查询返回的键值对数据
 	Rev   int64
-	Count int
+	Count int // 此次查询返回的键值对个数
 }
 
 //               ┌──────────────────┐

@@ -47,6 +47,7 @@ func newRevBytes() []byte {
 	return make([]byte, revBytesLen, markedRevBytesLen)
 }
 
+// 将main revision和sub revision写入，两者通过下划线分割
 func revToBytes(rev revision, bytes []byte) {
 	binary.BigEndian.PutUint64(bytes, uint64(rev.main))
 	bytes[8] = '_'
