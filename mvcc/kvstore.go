@@ -245,8 +245,8 @@ func (s *store) HashByRev(rev int64) (hash uint32, currentRev int64, compactRev 
 }
 
 func (s *store) updateCompactRev(rev int64) (<-chan struct{}, error) {
-	s.revMu.Lock()
-	if rev <= s.compactMainRev {
+	s.revMu.Lock() // 获取rev-mu的写锁
+	if rev <= s.compactMainRev { // 检测传入的rev参数是否合法
 		ch := make(chan struct{})
 		f := func(ctx context.Context) { s.compactBarrier(ctx, ch) }
 		s.fifoSched.Schedule(f)
@@ -258,17 +258,17 @@ func (s *store) updateCompactRev(rev int64) (<-chan struct{}, error) {
 		return nil, ErrFutureRev
 	}
 
-	s.compactMainRev = rev
+	s.compactMainRev = rev // 更新compact-main-rev
 
 	rbytes := newRevBytes()
-	revToBytes(revision{main: rev}, rbytes)
+	revToBytes(revision{main: rev}, rbytes) // 将传入的rev值封装成revision实例，并写入[]byte切片中
 
-	tx := s.b.BatchTx()
+	tx := s.b.BatchTx() // 获取bolt-db中的读写事务，并将上边创建的revision实例写入meta bucket
 	tx.Lock()
 	tx.UnsafePut(metaBucketName, scheduledCompactKeyName, rbytes)
 	tx.Unlock()
 	// ensure that desired compaction is persisted
-	s.b.ForceCommit()
+	s.b.ForceCommit() // 提交当前读写事务
 
 	s.revMu.Unlock()
 
@@ -283,15 +283,18 @@ func (s *store) compact(trace *traceutil.Trace, rev int64) (<-chan struct{}, err
 			return
 		}
 		start := time.Now()
-		keep := s.kvindex.Compact(rev)
+		keep := s.kvindex.Compact(rev) // 对内存索引进行压缩，其返回值是此次压缩过程中涉及的revision实例
 		indexCompactionPauseMs.Observe(float64(time.Since(start) / time.Millisecond))
-		if !s.scheduleCompaction(rev, keep) {
+		if !s.scheduleCompaction(rev, keep) { // 真正对bolt-db进行压缩的地方
 			s.compactBarrier(nil, ch)
 			return
 		}
-		close(ch)
+		close(ch) // 当正常压缩之后，会关闭该通道，通知监听者
 	}
 
+	// fifo-sched是一个fifo scheduler，在scheduler接口定义了一个schedule(j Job)方法，该方法会将Job放入调度器进行调度，
+	// 其中的job实际上就是一个func(context.Context)函数，
+	// 这里将对bolt-db的压缩操作(即上边定义的j函数）放入fifo调度器中，异步执行
 	s.fifoSched.Schedule(j)
 	trace.Step("schedule compaction")
 	return ch, nil
@@ -306,8 +309,13 @@ func (s *store) compactLockfree(rev int64) (<-chan struct{}, error) {
 	return s.compact(traceutil.TODO(), rev)
 }
 
+// 用于实现键值对的压缩；
+// 1、将传入的参数转换成revision实例；
+// 2、在meta bucket中记录此次压缩的键值对信息(key为scheduled-compact-rev，value为revision)；
+// 3、调用tree-index-compact方法完成对内存索引的压缩；
+// 4、通过fifo-scheduler异步完成对bolt-db的压缩；
 func (s *store) Compact(trace *traceutil.Trace, rev int64) (<-chan struct{}, error) {
-	s.mu.Lock()
+	s.mu.Lock() // 获取mu的写锁
 
 	ch, err := s.updateCompactRev(rev)
 	trace.Step("check and update compact revision")
