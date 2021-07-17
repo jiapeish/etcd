@@ -350,6 +350,8 @@ func (s *store) Commit() {
 	s.b.ForceCommit()
 }
 
+// 当follower节点收到快照数据时，会使用快照数据恢复当前节点的状态；
+// 调用该方法完成内存索引和store中其他状态的恢复
 func (s *store) Restore(b backend.Backend) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -358,31 +360,35 @@ func (s *store) Restore(b backend.Backend) error {
 	s.fifoSched.Stop()
 
 	atomic.StoreUint64(&s.consistentIndex, 0)
-	s.b = b
-	s.kvindex = newTreeIndex(s.lg)
+	s.b = b // 指向新的backend实例
+	s.kvindex = newTreeIndex(s.lg) // 指向新的内存索引
 	s.currentRev = 1
 	s.compactMainRev = -1
-	s.fifoSched = schedule.NewFIFOScheduler()
+	s.fifoSched = schedule.NewFIFOScheduler() // 指向新的fifo scheduler
 	s.stopc = make(chan struct{})
 
-	return s.restore()
+	return s.restore() // 开始恢复内存索引
 }
 
+// 1、批量读取bolt-db中所有键值对数据；
+// 2、将每个键值对封装成rev-key-value实例，并写入一个channel；
+// 3、由另一个单独的goroutine读取该通道，并完成内存索引的恢复；
 func (s *store) restore() error {
 	s.setupMetricsReporter()
 
-	min, max := newRevBytes(), newRevBytes()
-	revToBytes(revision{main: 1}, min)
+	min, max := newRevBytes(), newRevBytes() // 创建min, max; 后续在bolt-db中进行范围查询时的起始key和结束key就是min, max
+	revToBytes(revision{main: 1}, min) // min为1_0
 	revToBytes(revision{main: math.MaxInt64, sub: math.MaxInt64}, max)
 
 	keyToLease := make(map[string]lease.LeaseID)
 
 	// restore index
-	tx := s.b.BatchTx()
+	tx := s.b.BatchTx() // 获取读写事务，并加锁
 	tx.Lock()
 
+	// 在meta bucket中查询上次的压缩完成时的相关记录
 	_, finishedCompactBytes := tx.UnsafeRange(metaBucketName, finishedCompactKeyName, nil, 0)
-	if len(finishedCompactBytes) != 0 {
+	if len(finishedCompactBytes) != 0 { // 根据查询结果，恢复compact-main-rev字段
 		s.compactMainRev = bytesToRev(finishedCompactBytes[0]).main
 
 		if s.lg != nil {
@@ -396,34 +402,39 @@ func (s *store) restore() error {
 			plog.Printf("restore compact to %d", s.compactMainRev)
 		}
 	}
+	// 在meta bucket中查询上次的压缩启动时的相关记录
 	_, scheduledCompactBytes := tx.UnsafeRange(metaBucketName, scheduledCompactKeyName, nil, 0)
 	scheduledCompact := int64(0)
-	if len(scheduledCompactBytes) != 0 {
+	if len(scheduledCompactBytes) != 0 { // 根据查询结果恢复scheduled-compact
 		scheduledCompact = bytesToRev(scheduledCompactBytes[0]).main
 	}
 
 	// index keys concurrently as they're loaded in from tx
 	keysGauge.Set(0)
+	// 这里会启动一个单独的goroutine，用于接收从backend中读取的键值对数据，并恢复到新建的内存索引中(kv-index)
 	rkvc, revc := restoreIntoIndex(s.lg, s.kvindex)
 	for {
+		// 查询bolt-db中的key bucket，返回键值对数量的上限由第4个参数指定
 		keys, vals := tx.UnsafeRange(keyBucketName, min, max, int64(restoreChunkKeys))
-		if len(keys) == 0 {
+		if len(keys) == 0 { // 查询结果为空时直接跳出循环
 			break
 		}
 		// rkvc blocks if the total pending keys exceeds the restore
 		// chunk size to keep keys from consuming too much memory.
-		restoreChunk(s.lg, rkvc, keys, vals, keyToLease)
+		restoreChunk(s.lg, rkvc, keys, vals, keyToLease) // 将查询到的键值对写入recv-kv-chan中
 		if len(keys) < restoreChunkKeys {
 			// partial set implies final set
+			// 范围查询得到的结果数小于restore-chunk-keys，表示最后一次查询
 			break
 		}
 		// next set begins after where this one ended
+		// 更新min作为下一次范围查询的起始key
 		newMin := bytesToRev(keys[len(keys)-1][:revBytesLen])
 		newMin.sub++
 		revToBytes(newMin, min)
 	}
 	close(rkvc)
-	s.currentRev = <-revc
+	s.currentRev = <-revc // 从该通道获取恢复之后的current-rev
 
 	// keys in the range [compacted revision -N, compaction] might all be deleted due to compaction.
 	// the correct revision should be set to compaction revision in the case, not the largest revision
@@ -455,7 +466,7 @@ func (s *store) restore() error {
 
 	tx.Unlock()
 
-	if scheduledCompact != 0 {
+	if scheduledCompact != 0 { // 如果在开始恢复之前，存在未执行完的压缩操作，则重启该压缩操作；
 		s.compactLockfree(scheduledCompact)
 
 		if s.lg != nil {
@@ -474,23 +485,30 @@ func (s *store) restore() error {
 }
 
 type revKeyValue struct {
-	key  []byte
-	kv   mvccpb.KeyValue
-	kstr string
+	key  []byte // bolt-db中的key值，可以转换得到revision实例
+	kv   mvccpb.KeyValue // bolt-db中的value值
+	kstr string // 原始的key值
 }
 
+// 该函数启动一个后台goroutine，读取recv-kv-chan中的rev-key-value实例，并将其中的键值对数据恢复到内存索引中
 func restoreIntoIndex(lg *zap.Logger, idx index) (chan<- revKeyValue, <-chan int64) {
 	rkvc, revc := make(chan revKeyValue, restoreChunkKeys), make(chan int64, 1)
 	go func() {
-		currentRev := int64(1)
+		currentRev := int64(1) // 记录当前遇到的最大的main revision值
+		// 在该goroutine结束时（即recv-kv-chan关闭时），将当前已知的最大main revision值写入rev-chan中，待其他goroutine读取
 		defer func() { revc <- currentRev }()
 		// restore the tree index from streaming the unordered index.
+		// 虽然b-tree查找效率很高，但随着深度增加，效率随之下降，
+		// 这里使用map做了一层缓存，更加高效的查找对应的key-index实例;
+		// 前边从bolt-db中读取到的键值对数据并不是按照原始key值进行排序的，如果直接向b-tree写入，
+		// 则可能会引起节点的分裂等变换操作，效率比较低，所以加了这一层map做的缓存；
 		kiCache := make(map[string]*keyIndex, restoreChunkKeys)
-		for rkv := range rkvc {
-			ki, ok := kiCache[rkv.kstr]
+		for rkv := range rkvc { // 从channel中读取rev-key-value实例
+			ki, ok := kiCache[rkv.kstr] // 先查询缓存
 			// purge kiCache if many keys but still missing in the cache
+			// 如果ki-cache中缓存了大量的key，但是依然没有命中，则清理缓存；
 			if !ok && len(kiCache) >= restoreChunkKeys {
-				i := 10
+				i := 10 // 只清理10个key
 				for k := range kiCache {
 					delete(kiCache, k)
 					if i--; i == 0 {
@@ -499,50 +517,52 @@ func restoreIntoIndex(lg *zap.Logger, idx index) (chan<- revKeyValue, <-chan int
 				}
 			}
 			// cache miss, fetch from tree index if there
-			if !ok {
+			if !ok { // 如果缓存未命中，则从内存索引中查找对应的key-index实例，并添加到缓存中
 				ki = &keyIndex{key: rkv.kv.Key}
 				if idxKey := idx.KeyIndex(ki); idxKey != nil {
 					kiCache[rkv.kstr], ki = idxKey, idxKey
 					ok = true
 				}
 			}
-			rev := bytesToRev(rkv.key)
-			currentRev = rev.main
+			rev := bytesToRev(rkv.key) // 将rev-key-value中的key转换成revision实例
+			currentRev = rev.main // 更新current-rev值
 			if ok {
-				if isTombstone(rkv.key) {
-					ki.tombstone(lg, rev.main, rev.sub)
+				if isTombstone(rkv.key) { // 当前rev-key-value实例对应一个tomb-stone键值对
+					ki.tombstone(lg, rev.main, rev.sub) // 在对应的key-index实例中插入tomb-stone
 					continue
 				}
-				ki.put(lg, rev.main, rev.sub)
+				ki.put(lg, rev.main, rev.sub) // 在对应的key-index实例中添加正常的revision信息
 			} else if !isTombstone(rkv.key) {
+				// 如果从内存索引中仍然未查询到对应的key-index实例，则需要填充key-index实例中的其他字段，并添加到内存索引中
 				ki.restore(lg, revision{rkv.kv.CreateRevision, 0}, rev, rkv.kv.Version)
 				idx.Insert(ki)
-				kiCache[rkv.kstr] = ki
+				kiCache[rkv.kstr] = ki // 同时会将该key-index实例添加到缓存中
 			}
 		}
 	}()
 	return rkvc, revc
 }
 
+// restore方法中通过unsafe-range方法从bolt-db中查询键值对，然后通过该方法转换成recv-kv实例，并写入recv-kv-chan中
 func restoreChunk(lg *zap.Logger, kvc chan<- revKeyValue, keys, vals [][]byte, keyToLease map[string]lease.LeaseID) {
-	for i, key := range keys {
+	for i, key := range keys { // 遍历读取到的revision信息
 		rkv := revKeyValue{key: key}
-		if err := rkv.kv.Unmarshal(vals[i]); err != nil {
+		if err := rkv.kv.Unmarshal(vals[i]); err != nil { // 反序列化得到key-value
 			if lg != nil {
 				lg.Fatal("failed to unmarshal mvccpb.KeyValue", zap.Error(err))
 			} else {
 				plog.Fatalf("cannot unmarshal event: %v", err)
 			}
 		}
-		rkv.kstr = string(rkv.kv.Key)
+		rkv.kstr = string(rkv.kv.Key) // 记录原始key值
 		if isTombstone(key) {
-			delete(keyToLease, rkv.kstr)
+			delete(keyToLease, rkv.kstr) // 删除tomb-stone标识的键值对
 		} else if lid := lease.LeaseID(rkv.kv.Lease); lid != lease.NoLease {
 			keyToLease[rkv.kstr] = lid
 		} else {
 			delete(keyToLease, rkv.kstr)
 		}
-		kvc <- rkv
+		kvc <- rkv // 写入chan等待处理
 	}
 }
 
