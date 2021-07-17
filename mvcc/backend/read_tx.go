@@ -66,12 +66,12 @@ type ReadTx interface {
  */
 type readTx struct {
 	// mu protects accesses to the txReadBuffer
-	mu  sync.RWMutex
+	mu  sync.RWMutex // 读写buf中的缓冲区数据时，需要获取该锁进行同步
 	buf txReadBuffer // 用来缓存bucket与其中键值对集合的映射关系
 
 	// TODO: group and encapsulate {txMu, tx, buckets, txWg}, as they share the same lifecycle.
 	// txMu protects accesses to buckets and tx on Range requests.
-	txMu    sync.RWMutex
+	txMu    sync.RWMutex // 在进行查询之前，需要获取该锁进行同步
 	tx      *bolt.Tx // 该read-tx实例底层封装的bolt-tx实例，即bolt-db层面的只读事务
 	buckets map[string]*bolt.Bucket
 	// txWg protects tx from being rolled back at the end of a batch interval until all reads using this tx are done.
@@ -83,6 +83,8 @@ func (rt *readTx) Unlock()  { rt.mu.Unlock() }
 func (rt *readTx) RLock()   { rt.mu.RLock() }
 func (rt *readTx) RUnlock() { rt.mu.RUnlock() }
 
+// 在该方法中，只能对safe-range-bucket(即名称为'key'的bucket，该bucket中的key就是revision, value是键值对)进行真正的范围查询；
+// 对其他bucket的查询只能返回单个键值对；
 func (rt *readTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
 	if endKey == nil {
 		// forbid duplicates for single keys
@@ -128,6 +130,7 @@ func (rt *readTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]
 	return append(k2, keys...), append(v2, vals...)
 }
 
+// 该方法会遍历指定的bucket的缓存, 和bucket中的全部键值对，并通过visitor处理这些遍历到的键值对
 func (rt *readTx) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
 	dups := make(map[string]struct{})
 	getDups := func(k, v []byte) error {
@@ -140,11 +143,11 @@ func (rt *readTx) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) err
 		}
 		return visitor(k, v)
 	}
-	if err := rt.buf.ForEach(bucketName, getDups); err != nil {
+	if err := rt.buf.ForEach(bucketName, getDups); err != nil { // 遍历缓存中的键值对
 		return err
 	}
 	rt.txMu.Lock()
-	err := unsafeForEach(rt.tx, bucketName, visitNoDup)
+	err := unsafeForEach(rt.tx, bucketName, visitNoDup) // 遍历bolt-db中的键值对
 	rt.txMu.Unlock()
 	if err != nil {
 		return err

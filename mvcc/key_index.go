@@ -174,7 +174,7 @@ var (
 // generations:
 //    {empty} -> key SHOULD be removed.
 type keyIndex struct {
-	key         []byte
+	key         []byte // 客户端提供的原始key值
 	modified    revision // the main rev of the last modification
 	generations []generation
 }
@@ -462,6 +462,12 @@ func (ki *keyIndex) String() string {
 }
 
 // generation contains multiple revisions of a key.
+// 当第一次创建客户端指定的key时，对应的generations[0]会被创建，表示第0代版本信息；
+// 所以每个key值至少对应一个generation实例，如果没有，则表示当前key值应该被删除；
+// 每代中包含多个revision信息，当客户端后续不断修改该key时，generations[0]中会不断追加revision信息；
+// 当向generation实例中追加一个tomb-stone时，表示删除当前key，此时就会结束当前的generation实例，
+// 后续不再向该generation实例中追加revision信息，同时会创建新的generation实例；
+// 可以认为generation对应了当前key的一次从创建到删除的生命周期；
 type generation struct {
 	ver     int64
 	created revision // when the generation is created (put in first revision).

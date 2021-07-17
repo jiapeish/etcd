@@ -164,7 +164,7 @@ func NewDefaultBackend(path string) Backend {
 }
 
 func newBackend(bcfg BackendConfig) *backend {
-	bopts := &bolt.Options{}
+	bopts := &bolt.Options{} // 初始化bolt-db时的参数
 	if boltOpenOptions != nil {
 		*bopts = *boltOpenOptions
 	}
@@ -578,15 +578,16 @@ func defragdb(odb, tmpdb *bolt.DB, limit int) error {
 	return tmptx.Commit() // 提交读写事务（新数据库）
 }
 
+// 该方法根据入参开启新的只读事务或读写事务，并更新backend中的相关字段
 func (b *backend) begin(write bool) *bolt.Tx {
 	b.mu.RLock()
-	tx := b.unsafeBegin(write)
+	tx := b.unsafeBegin(write) // 开启事务
 	b.mu.RUnlock()
 
 	size := tx.Size()
 	db := tx.DB()
 	stats := db.Stats()
-	atomic.StoreInt64(&b.size, size)
+	atomic.StoreInt64(&b.size, size) // 更新backend-size字段，记录当前数据库大小
 	atomic.StoreInt64(&b.sizeInUse, size-(int64(stats.FreePageN)*int64(db.Info().PageSize)))
 	atomic.StoreInt64(&b.openReadTxN, int64(stats.OpenTxN))
 
@@ -594,7 +595,7 @@ func (b *backend) begin(write bool) *bolt.Tx {
 }
 
 func (b *backend) unsafeBegin(write bool) *bolt.Tx {
-	tx, err := b.db.Begin(write)
+	tx, err := b.db.Begin(write) // 调用bolt-db的接口开启事务
 	if err != nil {
 		if b.lg != nil {
 			b.lg.Fatal("failed to begin tx", zap.Error(err))
