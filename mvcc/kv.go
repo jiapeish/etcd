@@ -83,9 +83,12 @@ type ReadView interface {
 	// FirstRev returns the first KV revision at the time of opening the txn.
 	// After a compaction, the first revision increases to the compaction
 	// revision.
+	// 该方法会返回开启当前只读事务时的revision信息，这与下边的rev方法相同；
+	// 但是当进行一次压缩操作之后，该方法的返回值会被更新成压缩时的revision信息，也就是压缩后的最小revision；
 	FirstRev() int64
 
 	// Rev returns the revision of the KV at the time of opening the txn.
+	// 返回开启当前只读事务的revision信息
 	Rev() int64
 
 	// Range gets the keys in the range at rangeRev.

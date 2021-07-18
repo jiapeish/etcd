@@ -122,7 +122,7 @@ func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ig ConsistentI
 	}
 	s := &store{
 		cfg:     cfg,
-		b:       b,
+		b:       b, // 初始化backend字段
 		ig:      ig,
 		kvindex: newTreeIndex(lg),
 
