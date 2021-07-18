@@ -29,12 +29,16 @@ var (
 	watchBatchMaxRevs = 1000
 )
 
+// 为了提高效率，会批量处理watcher事件，在该结构体中可以封装多个event实例
 type eventBatch struct {
 	// evs is a batch of revision-ordered events
 	evs []mvccpb.Event
 	// revs is the minimum unique revisions observed for this batch
+	// 记录当前结构体中记录的event实例来自多少个不同的main revision
 	revs int
 	// moreRev is first revision with more events following this batch
+	// 当前结构体记录的event个数达到上限之后，后续event实例无法加入该event-batch中，
+	// 该字段记录了无法加入该event-batch实例的第一个event实例的main revision值；
 	moreRev int64
 }
 
@@ -52,17 +56,19 @@ func (eb *eventBatch) add(ev mvccpb.Event) {
 	}
 
 	// revision accounting
-	ebRev := eb.evs[len(eb.evs)-1].Kv.ModRevision
-	evRev := ev.Kv.ModRevision
+	ebRev := eb.evs[len(eb.evs)-1].Kv.ModRevision // 最后一个event实例对应的main revision值
+	evRev := ev.Kv.ModRevision // 新增event实例对应的main revision值
 	if evRev > ebRev {
 		eb.revs++
 		if eb.revs > watchBatchMaxRevs {
+			// 当前event-batch实例中记录的event实例已达上限，则更新该字段，
+			// 记录最后一个无法加入的event实例的main revision值
 			eb.moreRev = evRev
 			return
 		}
 	}
 
-	eb.evs = append(eb.evs, ev)
+	eb.evs = append(eb.evs, ev) // 如果能继续添加event实例，则将event实例添加到evs中
 }
 
 type watcherBatch map[*watcher]*eventBatch
@@ -221,10 +227,14 @@ func (wg *watcherGroup) delete(wa *watcher) bool {
 }
 
 // choose selects watchers from the watcher group to update
+// 根据unsynced watcher-group中记录的watcher个数对其进行分批返回，
+// 还会获取该批watcher实例中最小的min-rev字段
 func (wg *watcherGroup) choose(maxWatchers int, curRev, compactRev int64) (*watcherGroup, int64) {
 	if len(wg.watchers) < maxWatchers {
+		// 个数未达到上限时，直接调用下边的choose-all方法获取所有未完成同步的watcher中最小的min-rev字段
 		return wg, wg.chooseAll(curRev, compactRev)
 	}
+	// 超过上限时，需要分批处理
 	ret := newWatcherGroup()
 	for w := range wg.watchers {
 		if maxWatchers <= 0 {
@@ -236,6 +246,7 @@ func (wg *watcherGroup) choose(maxWatchers int, curRev, compactRev int64) (*watc
 	return &ret, ret.chooseAll(curRev, compactRev)
 }
 
+// 遍历watcher-group中记录的全部watcher实例，找到其中最小的min-rev字段值并返回
 func (wg *watcherGroup) chooseAll(curRev, compactRev int64) int64 {
 	minRev := int64(math.MaxInt64)
 	for w := range wg.watchers {
@@ -254,7 +265,7 @@ func (wg *watcherGroup) chooseAll(curRev, compactRev int64) int64 {
 			select {
 			case w.ch <- WatchResponse{WatchID: w.id, CompactRevision: compactRev}:
 				w.compacted = true
-				wg.delete(w)
+				wg.delete(w) // 将该watcher实例从watcher-group中删除
 			default:
 				// retry next time
 			}

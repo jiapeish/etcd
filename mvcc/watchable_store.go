@@ -125,7 +125,7 @@ func (s *watchableStore) watch(key, end []byte, startRev int64, id WatchID, ch c
 
 	s.mu.Lock()
 	s.revMu.RLock()
-	synced := startRev > s.store.currentRev || startRev == 0
+	synced := startRev > s.store.currentRev || startRev == 0 // 判断待添加的watcher实例是否已同步完成
 	if synced {
 		wa.minRev = s.store.currentRev + 1
 		if startRev > wa.minRev {
@@ -168,6 +168,7 @@ func (s *watchableStore) cancelWatcher(wa *watcher) {
 		}
 
 		var victimBatch watcherBatch
+		// 如果在synced 和 unsynced watcher-group中都没有，该watcher可能已经被触发了，则在victims中查找
 		for _, wb := range s.victims {
 			if wb[wa] != nil {
 				victimBatch = wb
@@ -240,6 +241,7 @@ func (s *watchableStore) syncWatchersLoop() {
 
 // syncVictimsLoop tries to write precomputed watcher responses to
 // watchers that had a blocked watcher channel
+// 定期处理watchable-store-victims中缓存的watcher-batch实例
 func (s *watchableStore) syncVictimsLoop() {
 	defer s.wg.Done()
 
@@ -266,6 +268,10 @@ func (s *watchableStore) syncVictimsLoop() {
 }
 
 // moveVictims tries to update watches with already pending event data
+// 处理victims的核心，
+// 该方法会遍历victims字段中记录的watch-batch实例，并尝试将其中的event实例封装成watch-response重新发送；
+// 如果发送依然失败，则将其放回victims中保存，等待下一次重试；
+// 如果发送成功，则根据相应的watcher的同步情况，将watcher实例迁移到(un)synced watcher-group中；
 func (s *watchableStore) moveVictims() (moved int) {
 	s.mu.Lock()
 	victims := s.victims
@@ -428,6 +434,7 @@ func (s *watchableStore) syncWatchers() int {
 }
 
 // kvsToEvents gets all events for the watchers from all key-value pairs
+// 将前面从bolt-db中查询到的键值对信息转换成相应的event实例
 func kvsToEvents(lg *zap.Logger, wg *watcherGroup, revs, vals [][]byte) (evs []mvccpb.Event) {
 	for i, v := range vals { // 键值对数据
 		var kv mvccpb.KeyValue
@@ -460,6 +467,7 @@ func kvsToEvents(lg *zap.Logger, wg *watcherGroup, revs, vals [][]byte) (evs []m
 
 // notify notifies the fact that given event at the given rev just happened to
 // watchers that watch on the key of the event.
+// 发送event事件
 func (s *watchableStore) notify(rev int64, evs []mvccpb.Event) {
 	var victim watcherBatch
 	// 将传入的event实例转换成watcher-batch，之后进行遍历，逐个watcher进行处理
@@ -496,9 +504,9 @@ func (s *watchableStore) addVictim(victim watcherBatch) {
 	if victim == nil {
 		return
 	}
-	s.victims = append(s.victims, victim)
+	s.victims = append(s.victims, victim) // 将watcher-batch实例追加到victims字段中
 	select {
-	case s.victimc <- struct{}{}:
+	case s.victimc <- struct{}{}: // 向victim-chan中发送信号
 	default:
 	}
 }
@@ -509,13 +517,18 @@ func (s *watchableStore) progress(w *watcher) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	// 只有watcher在synced watcher-group中时，才会响应该方法
 	if _, ok := s.synced.watchers[w]; ok {
+		// 这里发送的watch-response实例不包含任何event事件，只包含当前的revision值；
+		// 如果当前的watcher-ch通道已经阻塞，其中阻塞的watch-response实例中也包含了revision值，
+		// 也可以说明当前watcher的处理进度，则没有必要继续添加空的watch-response实例了；
 		w.send(WatchResponse{WatchID: w.id, Revision: s.rev()})
 		// If the ch is full, this watcher is receiving events.
 		// We do not need to send progress at all.
 	}
 }
 
+// 整个watcher机制的基础
 type watcher struct {
 	// the watcher key
 	key []byte
@@ -538,12 +551,14 @@ type watcher struct {
 	restore bool
 
 	// minRev is the minimum revision update the watcher will accept
+	// 能够触发当前watcher实例的最小revision值，发生在该revision之前的更新操作无法触发该watcher实例
 	minRev int64
-	id     WatchID
+	id     WatchID // 当前watcher实例的唯一标识
 
 	fcs []FilterFunc // 记录了过滤event实例的过滤器
 	// a chan to send out the watch response.
 	// The chan might be shared with other watchers.
+	// 当前watcher实例被触发之后，会向该通道中写入watch-response；该chan可能由多个watcher实例共享
 	ch chan<- WatchResponse
 }
 

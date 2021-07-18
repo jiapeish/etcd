@@ -93,18 +93,21 @@ type WatchResponse struct {
 // watchStream contains a collection of watchers that share
 // one streaming chan to send out watched events and other control events.
 type watchStream struct {
-	watchable watchable
-	ch        chan WatchResponse
+	watchable watchable // 记录关联的watchable-store实例
+	ch        chan WatchResponse // 通过该watch-stream实例创建的watcher实例在被触发时，都会将event事件写入该chan中
 
 	mu sync.Mutex // guards fields below it
 	// nextID is the ID pre-allocated for next new watcher in this stream
-	nextID   WatchID
+	nextID   WatchID // 在当前watch-stream实例中添加watcher实例时，分配的唯一标识
 	closed   bool
 	cancels  map[WatchID]cancelFunc
 	watchers map[WatchID]*watcher
 }
 
 // Watch creates a new watcher in the stream and returns its WatchID.
+// 该方法会创建watcher实例监听指定的key，或者范围监听[key, end),
+// 其中start-rev参数指定了该watcher实例监听的起始revision，如果start-rev <= 0，则表示从当前revision开始监听；
+// fcs表示event事件过滤器；
 func (ws *watchStream) Watch(id WatchID, key, end []byte, startRev int64, fcs ...FilterFunc) (WatchID, error) {
 	// prevent wrong range where key >= end lexicographically
 	// watch request with 'WithFromKey' has empty-byte range end
@@ -128,10 +131,11 @@ func (ws *watchStream) Watch(id WatchID, key, end []byte, startRev int64, fcs ..
 		return -1, ErrWatcherDuplicateID
 	}
 
+	// 创建watcher实例，且新建的watcher实例共用了同一个channel
 	w, c := ws.watchable.watch(key, end, startRev, id, ws.ch, fcs...)
 
-	ws.cancels[id] = c
-	ws.watchers[id] = w
+	ws.cancels[id] = c // 记录取消watcher实例时用到的回调函数
+	ws.watchers[id] = w // 记录新建的watcher实例
 	return id, nil
 }
 
@@ -149,15 +153,15 @@ func (ws *watchStream) Cancel(id WatchID) error {
 	if !ok {
 		return ErrWatcherNotExist
 	}
-	cancel()
+	cancel() // 调用取消回调，取消watcher实例
 
 	ws.mu.Lock()
 	// The watch isn't removed until cancel so that if Close() is called,
 	// it will wait for the cancel. Otherwise, Close() could close the
 	// watch channel while the store is still posting events.
 	if ww := ws.watchers[id]; ww == w {
-		delete(ws.cancels, id)
-		delete(ws.watchers, id)
+		delete(ws.cancels, id) // 清理对应的取消回调
+		delete(ws.watchers, id) // 清理对应的watcher实例
 	}
 	ws.mu.Unlock()
 
@@ -182,9 +186,11 @@ func (ws *watchStream) Rev() int64 {
 	return ws.watchable.rev()
 }
 
+// 该方法用来检测指定watcher的处理进度(progress，即当前watcher正在处理哪个revision中的更新操作），
+// 只有当watcher完全同步时，调用该方法才会创建一个空的watch-response，并写入watcher-ch通道中；
 func (ws *watchStream) RequestProgress(id WatchID) {
 	ws.mu.Lock()
-	w, ok := ws.watchers[id]
+	w, ok := ws.watchers[id] // 查询指定的watcher实例
 	ws.mu.Unlock()
 	if !ok {
 		return

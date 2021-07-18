@@ -19,6 +19,7 @@ import (
 	"go.etcd.io/etcd/pkg/traceutil"
 )
 
+// 如果当前读写事务中存在更新操作，则会在该方法中触发相应的watcher实例
 func (tw *watchableStoreTxnWrite) End() {
 	changes := tw.Changes() // 当前读写事务中执行的更新操作
 	if len(changes) == 0 { // 如果当前事务中没有任何更新操作，则直接结束当前事务
